@@ -1,6 +1,13 @@
+import hashlib
 import json
 
 import pytest
+
+
+def as_hex(address) -> str:
+    """direct_alice/direct_bob/direct_charlie fixtures yield raw-ish address
+    objects; contract-side Address.as_hex is '0x' + hex. Normalize here."""
+    return address.as_hex if hasattr(address, "as_hex") else "0x" + address.hex()
 
 
 VALID_CLIENT = "0x" + "1" * 40
@@ -547,3 +554,404 @@ def test_get_settlement_policy_missing_raises(direct_deploy):
     lacuna = direct_deploy("contracts/lacuna.py")
     with pytest.raises(Exception, match="not found"):
         lacuna.get_settlement_policy("does-not-exist")
+
+
+# =========================================================
+# BaselineEvidence
+# =========================================================
+
+
+def _hash_of(seed: str) -> str:
+    return hashlib.sha256(seed.encode()).hexdigest()
+
+
+def setup_agreement(lacuna, direct_vm, direct_alice, direct_bob, agreement_id="AGR-1"):
+    """Deploys as default sender, wires client=alice, contractor=bob."""
+    client = as_hex(direct_alice)
+    contractor = as_hex(direct_bob)
+    agreement_id, constitution_id, policy_id = create_agreement(
+        lacuna, agreement_id=agreement_id, client=client, contractor=contractor
+    )
+    return agreement_id, constitution_id, policy_id, client, contractor
+
+
+def submit_evidence(
+    lacuna,
+    agreement_id="AGR-1",
+    evidence_id="EV-1",
+    source_type="PUBLIC_ANALYTICS",
+    source_url="https://analytics.example.com/report",
+    content_hash=None,
+    summary="Historical churn dashboard export for the baseline window.",
+    metric_ref="monthly_churn_bps",
+    period_start=1_700_100_000,
+    period_end=1_700_150_000,
+):
+    if content_hash is None:
+        content_hash = _hash_of(evidence_id + source_url)
+    return lacuna.submit_baseline_evidence(
+        evidence_id,
+        agreement_id,
+        source_type,
+        source_url,
+        content_hash,
+        summary,
+        metric_ref,
+        period_start,
+        period_end,
+    )
+
+
+def test_submit_baseline_evidence_valid(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, *_ , client, _contractor = setup_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+
+    direct_vm.sender = direct_alice
+    evidence_id = submit_evidence(lacuna, agreement_id=agreement_id)
+
+    assert evidence_id == "EV-1"
+    assert lacuna.baseline_evidence_count == 1
+
+    record = json.loads(lacuna.get_baseline_evidence("EV-1"))
+    assert record["evidence_id"] == "EV-1"
+    assert record["agreement_id"] == agreement_id
+    assert record["submitter"].lower() == client.lower()
+    assert record["source_type"] == "PUBLIC_ANALYTICS"
+    assert record["source_url"] == "https://analytics.example.com/report"
+    assert record["source_host"] == "analytics.example.com"
+    assert record["metric_ref"] == "monthly_churn_bps"
+    assert record["status"] == "SUBMITTED"
+
+    listed = json.loads(lacuna.list_baseline_evidence(agreement_id))
+    assert len(listed) == 1
+    assert listed[0]["evidence_id"] == "EV-1"
+
+    # first submission lazily advances the agreement out of DRAFT
+    agreement = json.loads(lacuna.get_agreement(agreement_id))
+    assert agreement["status"] == "BASELINE_OPEN"
+
+
+def test_submit_baseline_evidence_by_contractor_also_allowed(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, *_ = setup_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+
+    direct_vm.sender = direct_bob
+    submit_evidence(lacuna, agreement_id=agreement_id)
+    assert lacuna.baseline_evidence_count == 1
+
+
+def test_submit_baseline_evidence_rejects_unauthorized_submitter(
+    direct_deploy, direct_vm, direct_alice, direct_bob, direct_charlie
+):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, *_ = setup_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+
+    direct_vm.sender = direct_charlie
+    with pytest.raises(Exception, match="client or contractor"):
+        submit_evidence(lacuna, agreement_id=agreement_id)
+
+
+def test_submit_baseline_evidence_rejects_unknown_agreement(direct_deploy, direct_vm, direct_alice):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception, match="Agreement not found"):
+        submit_evidence(lacuna, agreement_id="does-not-exist")
+
+
+def test_submit_baseline_evidence_rejects_wrong_agreement_status(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, *_ = setup_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+
+    direct_vm.sender = direct_alice
+    submit_evidence(
+        lacuna,
+        agreement_id=agreement_id,
+        evidence_id="EV-1",
+        source_type="PUBLIC_ANALYTICS",
+        source_url="https://analytics.example.com/a",
+    )
+    submit_evidence(
+        lacuna,
+        agreement_id=agreement_id,
+        evidence_id="EV-2",
+        source_type="COMMUNITY_ACTIVITY",
+        source_url="https://forum.example.org/b",
+        period_start=1_700_200_000,
+        period_end=1_700_250_000,
+    )
+    lacuna.freeze_baseline_evidence(agreement_id)
+
+    with pytest.raises(Exception, match="DRAFT or BASELINE_OPEN"):
+        submit_evidence(lacuna, agreement_id=agreement_id, evidence_id="EV-3")
+
+
+def test_submit_baseline_evidence_rejects_invalid_source_type(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, *_ = setup_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception, match="source_type"):
+        submit_evidence(lacuna, agreement_id=agreement_id, source_type="NOT_A_REAL_CATEGORY")
+
+
+def test_submit_baseline_evidence_rejects_invalid_url(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, *_ = setup_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception, match="source_url"):
+        submit_evidence(lacuna, agreement_id=agreement_id, source_url="not-a-url")
+
+
+def test_submit_baseline_evidence_rejects_invalid_content_hash(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, *_ = setup_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception, match="content_hash"):
+        submit_evidence(lacuna, agreement_id=agreement_id, content_hash="not-a-hash")
+
+
+def test_submit_baseline_evidence_rejects_empty_summary(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, *_ = setup_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception, match="summary"):
+        submit_evidence(lacuna, agreement_id=agreement_id, summary="")
+
+
+def test_submit_baseline_evidence_rejects_oversized_summary(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, *_ = setup_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception, match="summary"):
+        submit_evidence(lacuna, agreement_id=agreement_id, summary="x" * 1001)
+
+
+def test_submit_baseline_evidence_rejects_invalid_metric_ref(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, *_ = setup_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception, match="metric_ref"):
+        submit_evidence(lacuna, agreement_id=agreement_id, metric_ref="not_in_constitution")
+
+
+def test_submit_baseline_evidence_rejects_invalid_period(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, *_ = setup_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception, match="period_start must be before period_end"):
+        submit_evidence(lacuna, agreement_id=agreement_id, period_start=1_700_150_000, period_end=1_700_100_000)
+
+
+def test_submit_baseline_evidence_rejects_period_outside_baseline_window(
+    direct_deploy, direct_vm, direct_alice, direct_bob
+):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, *_ = setup_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception, match="baseline window"):
+        submit_evidence(
+            lacuna,
+            agreement_id=agreement_id,
+            period_start=OBSERVATION_START,
+            period_end=OBSERVATION_START + 1000,
+        )
+
+
+def test_submit_baseline_evidence_rejects_duplicate_evidence_id(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, *_ = setup_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    submit_evidence(lacuna, agreement_id=agreement_id, evidence_id="EV-1")
+
+    with pytest.raises(Exception, match="already exists"):
+        submit_evidence(
+            lacuna,
+            agreement_id=agreement_id,
+            evidence_id="EV-1",
+            source_url="https://analytics.example.com/other",
+        )
+
+
+def test_submit_baseline_evidence_rejects_duplicate_content_hash(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, *_ = setup_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    shared_hash = _hash_of("shared-content")
+    submit_evidence(lacuna, agreement_id=agreement_id, evidence_id="EV-1", content_hash=shared_hash)
+
+    with pytest.raises(Exception, match="Duplicate evidence"):
+        submit_evidence(
+            lacuna,
+            agreement_id=agreement_id,
+            evidence_id="EV-2",
+            source_url="https://analytics.example.com/other",
+            content_hash=shared_hash,
+        )
+
+
+def test_submit_baseline_evidence_cap_enforced(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, *_ = setup_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+
+    for i in range(48):
+        submit_evidence(
+            lacuna,
+            agreement_id=agreement_id,
+            evidence_id=f"EV-{i}",
+            source_url=f"https://analytics.example.com/report-{i}",
+            period_start=1_700_100_000 + i,
+            period_end=1_700_100_001 + i,
+        )
+
+    assert lacuna.baseline_evidence_count == 48
+
+    with pytest.raises(Exception, match="cap reached"):
+        submit_evidence(
+            lacuna,
+            agreement_id=agreement_id,
+            evidence_id="EV-overflow",
+            source_url="https://analytics.example.com/report-overflow",
+            period_start=1_700_100_100,
+            period_end=1_700_100_101,
+        )
+
+
+def _submit_two_valid_categories(lacuna, agreement_id):
+    submit_evidence(
+        lacuna,
+        agreement_id=agreement_id,
+        evidence_id="EV-1",
+        source_type="PUBLIC_ANALYTICS",
+        source_url="https://analytics.example.com/report",
+        period_start=1_700_100_000,
+        period_end=1_700_150_000,
+    )
+    submit_evidence(
+        lacuna,
+        agreement_id=agreement_id,
+        evidence_id="EV-2",
+        source_type="COMMUNITY_ACTIVITY",
+        source_url="https://forum.example.org/thread",
+        period_start=1_700_200_000,
+        period_end=1_700_250_000,
+    )
+
+
+def test_freeze_baseline_evidence_succeeds(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, *_ = setup_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    _submit_two_valid_categories(lacuna, agreement_id)
+
+    result = lacuna.freeze_baseline_evidence(agreement_id)
+    assert result == agreement_id
+
+    agreement = json.loads(lacuna.get_agreement(agreement_id))
+    assert agreement["status"] == "BASELINE_FROZEN"
+
+    listed = json.loads(lacuna.list_baseline_evidence(agreement_id))
+    assert len(listed) == 2
+    assert all(item["status"] == "FROZEN" for item in listed)
+
+
+def test_freeze_baseline_evidence_rejects_before_any_evidence(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, *_ = setup_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+
+    with pytest.raises(Exception, match="BASELINE_OPEN"):
+        lacuna.freeze_baseline_evidence(agreement_id)
+
+
+def test_freeze_baseline_evidence_insufficient_evidence(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, *_ = setup_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    submit_evidence(lacuna, agreement_id=agreement_id, evidence_id="EV-1")
+
+    with pytest.raises(Exception, match="Insufficient baseline evidence"):
+        lacuna.freeze_baseline_evidence(agreement_id)
+
+
+def test_freeze_baseline_evidence_insufficient_evidence_categories(
+    direct_deploy, direct_vm, direct_alice, direct_bob
+):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, *_ = setup_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    submit_evidence(
+        lacuna,
+        agreement_id=agreement_id,
+        evidence_id="EV-1",
+        source_type="PUBLIC_ANALYTICS",
+        source_url="https://analytics.example.com/a",
+        period_start=1_700_100_000,
+        period_end=1_700_150_000,
+    )
+    submit_evidence(
+        lacuna,
+        agreement_id=agreement_id,
+        evidence_id="EV-2",
+        source_type="PUBLIC_ANALYTICS",
+        source_url="https://analytics.example.org/b",
+        period_start=1_700_200_000,
+        period_end=1_700_250_000,
+    )
+
+    with pytest.raises(Exception, match="Insufficient evidence categories"):
+        lacuna.freeze_baseline_evidence(agreement_id)
+
+
+def test_freeze_baseline_evidence_insufficient_independent_sources(
+    direct_deploy, direct_vm, direct_alice, direct_bob
+):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, *_ = setup_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    submit_evidence(
+        lacuna,
+        agreement_id=agreement_id,
+        evidence_id="EV-1",
+        source_type="PUBLIC_ANALYTICS",
+        source_url="https://example.com/analytics-report",
+        period_start=1_700_100_000,
+        period_end=1_700_150_000,
+    )
+    submit_evidence(
+        lacuna,
+        agreement_id=agreement_id,
+        evidence_id="EV-2",
+        source_type="COMMUNITY_ACTIVITY",
+        source_url="https://example.com/community-thread",
+        period_start=1_700_200_000,
+        period_end=1_700_250_000,
+    )
+
+    with pytest.raises(Exception, match="Insufficient independent sources"):
+        lacuna.freeze_baseline_evidence(agreement_id)
+
+
+def test_no_evidence_can_be_added_after_freeze(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, *_ = setup_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    _submit_two_valid_categories(lacuna, agreement_id)
+    lacuna.freeze_baseline_evidence(agreement_id)
+
+    with pytest.raises(Exception, match="DRAFT or BASELINE_OPEN"):
+        submit_evidence(lacuna, agreement_id=agreement_id, evidence_id="EV-3")
+
+
+def test_frozen_evidence_remains_queryable_and_immutable(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, *_ = setup_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    _submit_two_valid_categories(lacuna, agreement_id)
+    lacuna.freeze_baseline_evidence(agreement_id)
+
+    record = json.loads(lacuna.get_baseline_evidence("EV-1"))
+    assert record["status"] == "FROZEN"
+    assert record["summary"] == "Historical churn dashboard export for the baseline window."
+    assert record["metric_ref"] == "monthly_churn_bps"
+
+    listed = json.loads(lacuna.list_baseline_evidence(agreement_id))
+    assert {item["evidence_id"] for item in listed} == {"EV-1", "EV-2"}

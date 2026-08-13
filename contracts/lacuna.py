@@ -4,7 +4,9 @@ from genlayer import *
 
 import json
 import hashlib
+import re
 from datetime import datetime
+from urllib.parse import urlparse
 
 # --- Status constants (spec section 15 / brief section 7) ---
 
@@ -88,6 +90,16 @@ ESCROW_AMOUNT_MAX = (1 << 128) - 1
 # caller (no wall-clock reads inside the contract).
 WINDOW_TIMESTAMP_MAX = (1 << 63) - 1
 
+# Baseline evidence bounds (brief section 12).
+EVIDENCE_ID_MAX_LEN = 100
+SOURCE_URL_MAX_LEN = 500
+SUMMARY_MAX_LEN = 1000
+MAX_BASELINE_EVIDENCE_PER_AGREEMENT = 48
+
+# content_hash must be a lowercase-hex sha256 digest -- deterministic,
+# network-free structural validation before any adjudication (Stage 4+).
+_CONTENT_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+
 
 def _is_valid_address(value: str) -> bool:
     if not isinstance(value, str):
@@ -132,6 +144,23 @@ def _validate_metric_schema(entries: list[str], field_name: str) -> None:
         raise gl.vm.UserError(f"{field_name} must not contain duplicates")
     for entry in entries:
         _validate_bounded_text(entry, f"{field_name} entry", METRIC_NAME_MAX_LEN)
+
+
+def _validate_source_url(source_url: str) -> str:
+    """Deterministic, network-free structural validation of an evidence source URL."""
+    if not source_url or len(source_url) > SOURCE_URL_MAX_LEN:
+        raise gl.vm.UserError(f"source_url must be 1-{SOURCE_URL_MAX_LEN} characters")
+    parsed = urlparse(source_url)
+    if parsed.scheme not in ("http", "https"):
+        raise gl.vm.UserError("source_url must use http or https")
+    if not parsed.netloc:
+        raise gl.vm.UserError("source_url is missing a host")
+    return parsed.netloc.lower()
+
+
+def _validate_content_hash(content_hash: str) -> None:
+    if not _CONTENT_HASH_RE.fullmatch(content_hash or ""):
+        raise gl.vm.UserError("content_hash must be a 64-character lowercase hex sha256 digest")
 
 
 class Lacuna(gl.Contract):
@@ -505,3 +534,177 @@ class Lacuna(gl.Contract):
         for policy_id in self.settlement_policies:
             result.append(json.loads(self.settlement_policies[policy_id]))
         return json.dumps(result)
+
+    # =========================================================
+    # BaselineEvidence (spec section 14 / brief section 4+12)
+    # =========================================================
+
+    @gl.public.write
+    def submit_baseline_evidence(
+        self,
+        evidence_id: str,
+        agreement_id: str,
+        source_type: str,
+        source_url: str,
+        content_hash: str,
+        summary: str,
+        metric_ref: str,
+        period_start: int,
+        period_end: int,
+    ) -> str:
+        if not evidence_id or len(evidence_id) > EVIDENCE_ID_MAX_LEN:
+            raise gl.vm.UserError(f"evidence_id must be 1-{EVIDENCE_ID_MAX_LEN} characters")
+        if evidence_id in self.baseline_evidence:
+            raise gl.vm.UserError("Baseline evidence ID already exists")
+
+        if agreement_id not in self.agreements:
+            raise gl.vm.UserError("Agreement not found")
+        agreement = json.loads(self.agreements[agreement_id])
+
+        # Baseline evidence collection is open from the moment an agreement
+        # is created (DRAFT) up through the explicit BASELINE_OPEN state;
+        # the first submission lazily advances DRAFT -> BASELINE_OPEN, the
+        # same pattern reality_lock.py uses for OPEN -> EVIDENCE_SUBMITTED.
+        if agreement["status"] not in ("DRAFT", "BASELINE_OPEN"):
+            raise gl.vm.UserError(
+                "Agreement must be in DRAFT or BASELINE_OPEN status to accept baseline evidence"
+            )
+
+        sender = gl.message.sender_address.as_hex
+        if sender.lower() not in (agreement["client"].lower(), agreement["contractor"].lower()):
+            raise gl.vm.UserError(
+                "Only the agreement's client or contractor may submit baseline evidence"
+            )
+
+        if source_type not in EVIDENCE_CATEGORIES:
+            allowed = ", ".join(sorted(EVIDENCE_CATEGORIES))
+            raise gl.vm.UserError(f"source_type must be one of: {allowed}")
+
+        source_host = _validate_source_url(source_url)
+        _validate_content_hash(content_hash)
+        _validate_bounded_text(summary, "summary", SUMMARY_MAX_LEN)
+
+        constitution = json.loads(self.constitutions[agreement["constitution_id"]])
+        allowed_metrics = (
+            {constitution["primary_metric"]}
+            | set(constitution["supporting_metric_schema"])
+            | set(constitution["guardrail_metric_schema"])
+        )
+        if metric_ref not in allowed_metrics:
+            raise gl.vm.UserError(
+                "metric_ref must match the agreement's constitution "
+                "(primary, supporting, or guardrail metric)"
+            )
+
+        _validate_timestamp(period_start, "period_start")
+        _validate_timestamp(period_end, "period_end")
+        if period_start >= period_end:
+            raise gl.vm.UserError("period_start must be before period_end")
+        if period_start < agreement["baseline_window_start"] or period_end > agreement["baseline_window_end"]:
+            raise gl.vm.UserError(
+                "Evidence period must fall entirely within the agreement's baseline window"
+            )
+
+        evidence_ids = json.loads(self.agreement_baseline_evidence_ids[agreement_id])
+        if len(evidence_ids) >= MAX_BASELINE_EVIDENCE_PER_AGREEMENT:
+            raise gl.vm.UserError(
+                f"Baseline evidence cap reached ({MAX_BASELINE_EVIDENCE_PER_AGREEMENT})"
+            )
+
+        norm_url = source_url.strip().lower()
+        for existing_id in evidence_ids:
+            existing = json.loads(self.baseline_evidence[existing_id])
+            if existing["content_hash"] == content_hash:
+                raise gl.vm.UserError("Duplicate evidence: content_hash already submitted for this agreement")
+            existing_url = existing["source_url"].strip().lower()
+            if existing_url == norm_url and existing["period_start"] == period_start and existing["period_end"] == period_end:
+                raise gl.vm.UserError("Duplicate evidence: same source_url and period already submitted")
+
+        record = {
+            "evidence_id": evidence_id,
+            "agreement_id": agreement_id,
+            "submitter": sender,
+            "source_type": source_type,
+            "source_url": source_url,
+            "source_host": source_host,
+            "content_hash": content_hash,
+            "summary": summary,
+            "metric_ref": metric_ref,
+            "period_start": period_start,
+            "period_end": period_end,
+            "submitted_at": datetime.now().isoformat(),
+            "status": "SUBMITTED",
+        }
+        self.baseline_evidence[evidence_id] = json.dumps(record)
+
+        evidence_ids.append(evidence_id)
+        self.agreement_baseline_evidence_ids[agreement_id] = json.dumps(evidence_ids)
+
+        self.baseline_evidence_count = u256(int(self.baseline_evidence_count) + 1)
+
+        if agreement["status"] == "DRAFT":
+            agreement["status"] = "BASELINE_OPEN"
+            self.agreements[agreement_id] = json.dumps(agreement)
+
+        return evidence_id
+
+    @gl.public.view
+    def get_baseline_evidence(self, evidence_id: str) -> str:
+        if evidence_id not in self.baseline_evidence:
+            raise gl.vm.UserError("Baseline evidence not found")
+        return self.baseline_evidence[evidence_id]
+
+    @gl.public.view
+    def list_baseline_evidence(self, agreement_id: str) -> str:
+        if agreement_id not in self.agreements:
+            raise gl.vm.UserError("Agreement not found")
+        evidence_ids = json.loads(self.agreement_baseline_evidence_ids[agreement_id])
+        result = []
+        for evidence_id in evidence_ids:
+            result.append(json.loads(self.baseline_evidence[evidence_id]))
+        return json.dumps(result)
+
+    @gl.public.write
+    def freeze_baseline_evidence(self, agreement_id: str) -> str:
+        if agreement_id not in self.agreements:
+            raise gl.vm.UserError("Agreement not found")
+        agreement = json.loads(self.agreements[agreement_id])
+
+        if agreement["status"] != "BASELINE_OPEN":
+            raise gl.vm.UserError("Agreement must be in BASELINE_OPEN status to freeze baseline evidence")
+
+        constitution = json.loads(self.constitutions[agreement["constitution_id"]])
+        minimum_independent_sources = constitution["minimum_independent_sources"]
+
+        evidence_ids = json.loads(self.agreement_baseline_evidence_ids[agreement_id])
+        evidence_records = [json.loads(self.baseline_evidence[eid]) for eid in evidence_ids]
+
+        if len(evidence_records) < minimum_independent_sources:
+            raise gl.vm.UserError(
+                f"Insufficient baseline evidence: at least {minimum_independent_sources} "
+                f"item(s) required, found {len(evidence_records)}"
+            )
+
+        present_categories = {record["source_type"] for record in evidence_records}
+        required_categories = set(constitution["minimum_evidence_categories"])
+        missing_categories = required_categories - present_categories
+        if missing_categories:
+            raise gl.vm.UserError(
+                "Insufficient evidence categories, missing: " + ", ".join(sorted(missing_categories))
+            )
+
+        independent_hosts = {record["source_host"] for record in evidence_records}
+        if len(independent_hosts) < minimum_independent_sources:
+            raise gl.vm.UserError(
+                f"Insufficient independent sources: at least {minimum_independent_sources} "
+                f"distinct source host(s) required, found {len(independent_hosts)}"
+            )
+
+        for record in evidence_records:
+            record["status"] = "FROZEN"
+            self.baseline_evidence[record["evidence_id"]] = json.dumps(record)
+
+        agreement["status"] = "BASELINE_FROZEN"
+        self.agreements[agreement_id] = json.dumps(agreement)
+
+        return agreement_id
