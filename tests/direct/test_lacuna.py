@@ -955,3 +955,357 @@ def test_frozen_evidence_remains_queryable_and_immutable(direct_deploy, direct_v
 
     listed = json.loads(lacuna.list_baseline_evidence(agreement_id))
     assert {item["evidence_id"] for item in listed} == {"EV-1", "EV-2"}
+
+
+# =========================================================
+# CounterfactualBaseline evaluation (Stage 4)
+# =========================================================
+
+
+def _fenced(obj) -> str:
+    """Wrap JSON in markdown fences, as real LLM output typically is. Also
+    keeps the mock response un-parseable as top-level JSON so gltest's
+    direct-mode LLM mock does NOT auto-decode it into a dict -- the contract
+    must receive a raw string and do its own fence-stripping/json.loads,
+    exactly like production."""
+    return "```json\n" + json.dumps(obj) + "\n```"
+
+
+VALID_BASELINE_VERDICT = {
+    "expected_value_bps": 3400,
+    "expected_low_bps": 2900,
+    "expected_high_bps": 4100,
+    "confidence_bps": 8800,
+    "method_valid": True,
+    "reason_codes": ["HISTORICAL_TREND_SUPPORTED", "EXTERNAL_BENCHMARK_CONSISTENT"],
+    "evidence_refs": ["EV-1", "EV-2"],
+    "summary": "Historical trend and an external benchmark support a stable expected churn range.",
+}
+
+INVALID_METHOD_VERDICT = {
+    "expected_value_bps": 0,
+    "expected_low_bps": 0,
+    "expected_high_bps": 0,
+    "confidence_bps": 1000,
+    "method_valid": False,
+    "reason_codes": ["BASELINE_EVIDENCE_INSUFFICIENT"],
+    "evidence_refs": [],
+    "summary": "Evidence is too thin and internally inconsistent to support a defensible baseline.",
+}
+
+
+def _ready_for_baseline_evaluation(lacuna, direct_vm, direct_alice, direct_bob, agreement_id="AGR-1"):
+    """Agreement with two categories of frozen baseline evidence, evidence
+    source URLs mocked. Ready for evaluate_baseline()."""
+    agreement_id, *_ = setup_agreement(lacuna, direct_vm, direct_alice, direct_bob, agreement_id=agreement_id)
+    direct_vm.sender = direct_alice
+    _submit_two_valid_categories(lacuna, agreement_id)
+    lacuna.freeze_baseline_evidence(agreement_id)
+    direct_vm.mock_web("analytics.example.com/report", {"status": 200, "body": "Churn trended down steadily."})
+    direct_vm.mock_web("forum.example.org/thread", {"status": 200, "body": "Community sentiment stable."})
+    return agreement_id
+
+
+def test_evaluate_baseline_valid_stores_expected_range(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id = _ready_for_baseline_evaluation(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.mock_llm(r".*", _fenced(VALID_BASELINE_VERDICT))
+
+    result = json.loads(lacuna.evaluate_baseline(agreement_id))
+    assert result["expected_value_bps"] == 3400
+    assert result["expected_low_bps"] == 2900
+    assert result["expected_high_bps"] == 4100
+    assert result["confidence_bps"] == 8800
+    assert result["status"] == "PROPOSED"
+
+    agreement = json.loads(lacuna.get_agreement(agreement_id))
+    assert agreement["status"] == "BASELINE_PROPOSED"
+    assert agreement["baseline_id"] == result["baseline_id"]
+
+    baseline = json.loads(lacuna.get_counterfactual_baseline(result["baseline_id"]))
+    assert baseline["expected_value_bps"] == 3400
+    assert baseline["status"] == "PROPOSED"
+
+
+def test_evaluate_baseline_preserves_evidence_refs(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id = _ready_for_baseline_evaluation(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.mock_llm(r".*", _fenced(VALID_BASELINE_VERDICT))
+
+    result = json.loads(lacuna.evaluate_baseline(agreement_id))
+    assert result["evidence_refs"] == ["EV-1", "EV-2"]
+    assert result["reason_codes"] == ["HISTORICAL_TREND_SUPPORTED", "EXTERNAL_BENCHMARK_CONSISTENT"]
+
+
+def test_evaluate_baseline_rejects_malformed_json(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id = _ready_for_baseline_evaluation(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.mock_llm(r".*", "this is not json at all")
+
+    with pytest.raises(Exception, match="not valid JSON"):
+        lacuna.evaluate_baseline(agreement_id)
+
+
+def test_evaluate_baseline_rejects_non_object_json(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id = _ready_for_baseline_evaluation(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.mock_llm(r".*", _fenced([1, 2, 3]))
+
+    with pytest.raises(Exception, match="expected a JSON object"):
+        lacuna.evaluate_baseline(agreement_id)
+
+
+def test_evaluate_baseline_rejects_missing_field(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id = _ready_for_baseline_evaluation(lacuna, direct_vm, direct_alice, direct_bob)
+    bad = dict(VALID_BASELINE_VERDICT)
+    del bad["summary"]
+    direct_vm.mock_llm(r".*", _fenced(bad))
+
+    with pytest.raises(Exception, match="missing field 'summary'"):
+        lacuna.evaluate_baseline(agreement_id)
+
+
+def test_evaluate_baseline_tolerates_extra_unknown_fields(direct_deploy, direct_vm, direct_alice, direct_bob):
+    """Design choice (documented in the Stage 4 report): unknown top-level
+    keys are ignored rather than rejected -- only the required fields are
+    validated for presence/type/range, since an unused extra key cannot
+    affect what gets stored."""
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id = _ready_for_baseline_evaluation(lacuna, direct_vm, direct_alice, direct_bob)
+    extra = dict(VALID_BASELINE_VERDICT, unexpected_field="ignored", another_bonus_key=123)
+    direct_vm.mock_llm(r".*", _fenced(extra))
+
+    result = json.loads(lacuna.evaluate_baseline(agreement_id))
+    assert result["expected_value_bps"] == 3400
+    assert "unexpected_field" not in result
+
+
+def test_evaluate_baseline_rejects_wrong_field_type(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id = _ready_for_baseline_evaluation(lacuna, direct_vm, direct_alice, direct_bob)
+    bad = dict(VALID_BASELINE_VERDICT, confidence_bps="high")
+    direct_vm.mock_llm(r".*", _fenced(bad))
+
+    with pytest.raises(Exception, match="confidence_bps must be an integer"):
+        lacuna.evaluate_baseline(agreement_id)
+
+
+def test_evaluate_baseline_rejects_bps_below_zero(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id = _ready_for_baseline_evaluation(lacuna, direct_vm, direct_alice, direct_bob)
+    bad = dict(VALID_BASELINE_VERDICT, confidence_bps=-1)
+    direct_vm.mock_llm(r".*", _fenced(bad))
+
+    with pytest.raises(Exception, match="confidence_bps must be between 0 and 10000"):
+        lacuna.evaluate_baseline(agreement_id)
+
+
+def test_evaluate_baseline_rejects_bps_above_10000(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id = _ready_for_baseline_evaluation(lacuna, direct_vm, direct_alice, direct_bob)
+    bad = dict(VALID_BASELINE_VERDICT, expected_high_bps=10001)
+    direct_vm.mock_llm(r".*", _fenced(bad))
+
+    with pytest.raises(Exception, match="expected_high_bps must be between 0 and 10000"):
+        lacuna.evaluate_baseline(agreement_id)
+
+
+def test_evaluate_baseline_rejects_low_greater_than_expected(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id = _ready_for_baseline_evaluation(lacuna, direct_vm, direct_alice, direct_bob)
+    bad = dict(VALID_BASELINE_VERDICT, expected_low_bps=3500)
+    direct_vm.mock_llm(r".*", _fenced(bad))
+
+    with pytest.raises(Exception, match="expected_low_bps must be <= expected_value_bps <= expected_high_bps"):
+        lacuna.evaluate_baseline(agreement_id)
+
+
+def test_evaluate_baseline_rejects_expected_greater_than_high(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id = _ready_for_baseline_evaluation(lacuna, direct_vm, direct_alice, direct_bob)
+    bad = dict(VALID_BASELINE_VERDICT, expected_value_bps=4200)
+    direct_vm.mock_llm(r".*", _fenced(bad))
+
+    with pytest.raises(Exception, match="expected_low_bps must be <= expected_value_bps <= expected_high_bps"):
+        lacuna.evaluate_baseline(agreement_id)
+
+
+def test_evaluate_baseline_rejects_unknown_reason_code(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id = _ready_for_baseline_evaluation(lacuna, direct_vm, direct_alice, direct_bob)
+    bad = dict(VALID_BASELINE_VERDICT, reason_codes=["NOT_A_REAL_CODE"])
+    direct_vm.mock_llm(r".*", _fenced(bad))
+
+    with pytest.raises(Exception, match="Unknown reason code: NOT_A_REAL_CODE"):
+        lacuna.evaluate_baseline(agreement_id)
+
+
+def test_evaluate_baseline_rejects_nonexistent_evidence_ref(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id = _ready_for_baseline_evaluation(lacuna, direct_vm, direct_alice, direct_bob)
+    bad = dict(VALID_BASELINE_VERDICT, evidence_refs=["EV-does-not-exist"])
+    direct_vm.mock_llm(r".*", _fenced(bad))
+
+    with pytest.raises(Exception, match="evidence_refs references evidence outside the frozen baseline evidence set"):
+        lacuna.evaluate_baseline(agreement_id)
+
+
+def test_evaluate_baseline_rejects_duplicate_evidence_ref(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id = _ready_for_baseline_evaluation(lacuna, direct_vm, direct_alice, direct_bob)
+    bad = dict(VALID_BASELINE_VERDICT, evidence_refs=["EV-1", "EV-1"])
+    direct_vm.mock_llm(r".*", _fenced(bad))
+
+    with pytest.raises(Exception, match="evidence_refs must not contain duplicate references"):
+        lacuna.evaluate_baseline(agreement_id)
+
+
+def test_evaluate_baseline_rejects_empty_summary(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id = _ready_for_baseline_evaluation(lacuna, direct_vm, direct_alice, direct_bob)
+    bad = dict(VALID_BASELINE_VERDICT, summary="")
+    direct_vm.mock_llm(r".*", _fenced(bad))
+
+    with pytest.raises(Exception, match="summary must be 1-"):
+        lacuna.evaluate_baseline(agreement_id)
+
+
+def test_evaluate_baseline_rejects_oversized_summary(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id = _ready_for_baseline_evaluation(lacuna, direct_vm, direct_alice, direct_bob)
+    bad = dict(VALID_BASELINE_VERDICT, summary="x" * 1001)
+    direct_vm.mock_llm(r".*", _fenced(bad))
+
+    with pytest.raises(Exception, match="summary must be 1-"):
+        lacuna.evaluate_baseline(agreement_id)
+
+
+def test_evaluate_baseline_handles_inaccessible_source_gracefully(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, *_ = setup_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    _submit_two_valid_categories(lacuna, agreement_id)
+    lacuna.freeze_baseline_evidence(agreement_id)
+    # No mock_web registered: gl.nondet.web.render will raise, and the
+    # leader must classify the source as SOURCE_INACCESSIBLE instead of
+    # crashing the whole evaluation.
+    inaccessible_verdict = dict(
+        INVALID_METHOD_VERDICT, reason_codes=["HISTORICAL_WINDOW_TOO_WEAK"]
+    )
+    direct_vm.mock_llm(r".*", _fenced(inaccessible_verdict))
+
+    result = json.loads(lacuna.evaluate_baseline(agreement_id))
+    assert result["status"] == "VOID"
+    assert result["reason_codes"] == ["HISTORICAL_WINDOW_TOO_WEAK"]
+
+
+def test_evaluate_baseline_handles_contradictory_evidence(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id = _ready_for_baseline_evaluation(lacuna, direct_vm, direct_alice, direct_bob)
+    conflicted_verdict = dict(
+        VALID_BASELINE_VERDICT,
+        confidence_bps=4000,
+        reason_codes=["BASELINE_SOURCE_CONFLICT"],
+        summary="Sources disagree on the direction of the trend; confidence reduced accordingly.",
+    )
+    direct_vm.mock_llm(r".*", _fenced(conflicted_verdict))
+
+    result = json.loads(lacuna.evaluate_baseline(agreement_id))
+    assert result["reason_codes"] == ["BASELINE_SOURCE_CONFLICT"]
+    assert result["confidence_bps"] == 4000
+
+
+def test_evaluate_baseline_method_invalid_does_not_advance_agreement(
+    direct_deploy, direct_vm, direct_alice, direct_bob
+):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id = _ready_for_baseline_evaluation(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.mock_llm(r".*", _fenced(INVALID_METHOD_VERDICT))
+
+    result = json.loads(lacuna.evaluate_baseline(agreement_id))
+    assert result["status"] == "VOID"
+
+    agreement = json.loads(lacuna.get_agreement(agreement_id))
+    assert agreement["status"] == "BASELINE_FROZEN"
+    assert agreement["baseline_id"] == ""
+
+    # the conclusion is preserved and independently queryable
+    baseline = json.loads(lacuna.get_counterfactual_baseline(result["baseline_id"]))
+    assert baseline["status"] == "VOID"
+    assert baseline["reason_codes"] == ["BASELINE_EVIDENCE_INSUFFICIENT"]
+
+    # frozen evidence was never touched
+    evidence = json.loads(lacuna.list_baseline_evidence(agreement_id))
+    assert all(item["status"] == "FROZEN" for item in evidence)
+
+
+def test_evaluate_baseline_can_be_retried_after_invalid_methodology(
+    direct_deploy, direct_vm, direct_alice, direct_bob
+):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id = _ready_for_baseline_evaluation(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.mock_llm(r".*", _fenced(INVALID_METHOD_VERDICT))
+    lacuna.evaluate_baseline(agreement_id)
+
+    direct_vm.clear_mocks()  # drop the stale VOID-verdict mock (first match wins)
+    direct_vm.mock_web("analytics.example.com/report", {"status": 200, "body": "Churn trended down steadily."})
+    direct_vm.mock_web("forum.example.org/thread", {"status": 200, "body": "Community sentiment stable."})
+    direct_vm.mock_llm(r".*", _fenced(VALID_BASELINE_VERDICT))
+    result = json.loads(lacuna.evaluate_baseline(agreement_id))
+    assert result["status"] == "PROPOSED"
+
+    agreement = json.loads(lacuna.get_agreement(agreement_id))
+    assert agreement["status"] == "BASELINE_PROPOSED"
+
+    history = json.loads(lacuna.list_baseline_evaluations(agreement_id))
+    assert len(history) == 2
+    assert history[0]["status"] == "VOID"
+    assert history[1]["status"] == "PROPOSED"
+
+
+def test_evaluate_baseline_cannot_run_before_baseline_frozen(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, *_ = setup_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    direct_vm.mock_llm(r".*", _fenced(VALID_BASELINE_VERDICT))
+
+    with pytest.raises(Exception, match="BASELINE_FROZEN"):
+        lacuna.evaluate_baseline(agreement_id)
+
+
+def test_repeated_evaluation_cannot_overwrite_valid_proposed_baseline(
+    direct_deploy, direct_vm, direct_alice, direct_bob
+):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id = _ready_for_baseline_evaluation(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.mock_llm(r".*", _fenced(VALID_BASELINE_VERDICT))
+    first = json.loads(lacuna.evaluate_baseline(agreement_id))
+
+    direct_vm.mock_llm(r".*", _fenced(dict(VALID_BASELINE_VERDICT, expected_value_bps=9999, expected_low_bps=9998, expected_high_bps=10000)))
+    with pytest.raises(Exception, match="BASELINE_FROZEN"):
+        lacuna.evaluate_baseline(agreement_id)
+
+    agreement = json.loads(lacuna.get_agreement(agreement_id))
+    assert agreement["baseline_id"] == first["baseline_id"]
+    unchanged = json.loads(lacuna.get_counterfactual_baseline(first["baseline_id"]))
+    assert unchanged["expected_value_bps"] == 3400
+
+
+def test_evaluate_baseline_requires_authorized_party(
+    direct_deploy, direct_vm, direct_alice, direct_bob, direct_charlie
+):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id = _ready_for_baseline_evaluation(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.mock_llm(r".*", _fenced(VALID_BASELINE_VERDICT))
+    direct_vm.sender = direct_charlie
+
+    with pytest.raises(Exception, match="client or contractor"):
+        lacuna.evaluate_baseline(agreement_id)
+
+
+def test_evaluate_baseline_rejects_unknown_agreement(direct_deploy, direct_vm, direct_alice):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception, match="Agreement not found"):
+        lacuna.evaluate_baseline("does-not-exist")
