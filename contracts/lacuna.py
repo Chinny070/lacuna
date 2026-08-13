@@ -3,6 +3,8 @@
 from genlayer import *
 
 import json
+import hashlib
+from datetime import datetime
 
 # --- Status constants (spec section 15 / brief section 7) ---
 
@@ -28,15 +30,119 @@ BASELINE_STATUSES = ("PROPOSED", "CHALLENGED", "FINAL", "VOID")
 
 VERDICT_STATUSES = ("PROPOSED", "APPEALED", "FINAL", "VOID")
 
+# Evidence categories a constitution's minimum_evidence_categories may draw
+# from (spec section 22). Generic on purpose -- not tied to one vertical.
+EVIDENCE_CATEGORIES = frozenset(
+    {
+        "PUBLIC_ANALYTICS",
+        "GITHUB",
+        "COMMUNITY_ACTIVITY",
+        "PUBLIC_ANNOUNCEMENT",
+        "SECURITY_REPORT",
+        "STATUS_PAGE",
+        "PUBLIC_METRIC_DASHBOARD",
+        "REPOSITORY_ACTIVITY",
+        "MARKET_BENCHMARK",
+        "PUBLIC_DATASET",
+        "PUBLIC_FORUM",
+        "PROJECT_DOCUMENTATION",
+    }
+)
+
+# Falsification checks a constitution may require (brief section 16).
+FALSIFICATION_CHECKS = frozenset(
+    {
+        "PRE_TREND_CHECK",
+        "PLACEBO_WINDOW_CHECK",
+        "PERSISTENCE_CHECK",
+        "GUARDRAIL_CHECK",
+        "METHODOLOGY_CONSISTENCY_CHECK",
+        "CROSS_SIGNAL_CHECK",
+    }
+)
+
+# --- Bounds ---
+
+BPS_MIN = 0
+BPS_MAX = 10000
+
+TITLE_MAX_LEN = 200
+OBLIGATION_MAX_LEN = 2000
+
+NAME_MAX_LEN = 100
+METRIC_NAME_MAX_LEN = 100
+MAX_SCHEMA_ENTRIES = 20
+METHOD_MAX_LEN = 500
+SHOCK_POLICY_MAX_LEN = 500
+RULE_MAX_LEN = 300
+MAX_RULE_ENTRIES = 20
+
+MIN_INDEPENDENT_SOURCES_MAX = 50
+
+# u256 is the storage type for escrow_amount; keep a generous but bounded
+# application-level ceiling well inside u256 range so obviously-wrong inputs
+# (accidental extra zeros, negative-as-huge-unsigned, etc.) fail fast.
+ESCROW_AMOUNT_MAX = (1 << 128) - 1
+
+# Windows are unix-epoch seconds, deterministic integers supplied by the
+# caller (no wall-clock reads inside the contract).
+WINDOW_TIMESTAMP_MAX = (1 << 63) - 1
+
+
+def _is_valid_address(value: str) -> bool:
+    if not isinstance(value, str):
+        return False
+    if not value.startswith("0x") and not value.startswith("0X"):
+        return False
+    hex_part = value[2:]
+    if len(hex_part) != 40:
+        return False
+    try:
+        int(hex_part, 16)
+    except ValueError:
+        return False
+    return int(hex_part, 16) != 0
+
+
+def _validate_bounded_text(value: str, field_name: str, max_len: int, required: bool = True) -> None:
+    if required and not value:
+        raise gl.vm.UserError(f"{field_name} must not be empty")
+    if value and len(value) > max_len:
+        raise gl.vm.UserError(f"{field_name} must be at most {max_len} characters")
+
+
+def _validate_bps(value: int, field_name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise gl.vm.UserError(f"{field_name} must be an integer")
+    if value < BPS_MIN or value > BPS_MAX:
+        raise gl.vm.UserError(f"{field_name} must be between {BPS_MIN} and {BPS_MAX}")
+
+
+def _validate_timestamp(value: int, field_name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise gl.vm.UserError(f"{field_name} must be an integer unix timestamp")
+    if value < 0 or value > WINDOW_TIMESTAMP_MAX:
+        raise gl.vm.UserError(f"{field_name} is out of range")
+
+
+def _validate_metric_schema(entries: list[str], field_name: str) -> None:
+    if len(entries) > MAX_SCHEMA_ENTRIES:
+        raise gl.vm.UserError(f"{field_name} must have at most {MAX_SCHEMA_ENTRIES} entries")
+    if len(entries) != len(set(entries)):
+        raise gl.vm.UserError(f"{field_name} must not contain duplicates")
+    for entry in entries:
+        _validate_bounded_text(entry, f"{field_name} entry", METRIC_NAME_MAX_LEN)
+
 
 class Lacuna(gl.Contract):
     # PerformanceAgreement
     agreements: TreeMap[str, str]
     agreement_count: u256
 
-    # BaselineConstitution
+    # BaselineConstitution (id -> record) + name -> [constitution_id, ...] versions
     constitutions: TreeMap[str, str]
     constitution_count: u256
+    constitution_versions: TreeMap[str, str]
 
     # BaselineEvidence (id -> record) + agreement -> [evidence_id, ...]
     baseline_evidence: TreeMap[str, str]
@@ -66,9 +172,10 @@ class Lacuna(gl.Contract):
     verdicts: TreeMap[str, str]
     verdict_count: u256
 
-    # SettlementPolicy
+    # SettlementPolicy (id -> record) + name -> [policy_id, ...] versions
     settlement_policies: TreeMap[str, str]
     settlement_policy_count: u256
+    settlement_policy_versions: TreeMap[str, str]
 
     # PerformanceAppeal (id -> record) + verdict -> [appeal_id, ...]
     appeals: TreeMap[str, str]
@@ -87,7 +194,9 @@ class Lacuna(gl.Contract):
         self.settlement_policy_count = u256(0)
         self.appeal_count = u256(0)
 
-    # --- Stage 1 proof-of-storage methods only. Full lifecycle is Stage 2+. ---
+    # =========================================================
+    # PerformanceAgreement (spec section 14 / brief section 4+7)
+    # =========================================================
 
     @gl.public.write
     def create_agreement(
@@ -97,13 +206,55 @@ class Lacuna(gl.Contract):
         contractor: str,
         title: str,
         obligation: str,
+        constitution_id: str,
+        settlement_policy_id: str,
+        baseline_window_start: int,
+        baseline_window_end: int,
+        observation_window_start: int,
+        observation_window_end: int,
+        escrow_amount: int,
     ) -> str:
+        if not agreement_id or len(agreement_id) > NAME_MAX_LEN:
+            raise gl.vm.UserError(f"agreement_id must be 1-{NAME_MAX_LEN} characters")
         if agreement_id in self.agreements:
             raise gl.vm.UserError("Agreement ID already exists")
-        if not title or len(title) > 200:
-            raise gl.vm.UserError("Title must be 1-200 characters")
-        if not obligation or len(obligation) > 2000:
-            raise gl.vm.UserError("Obligation must be 1-2000 characters")
+
+        _validate_bounded_text(title, "title", TITLE_MAX_LEN)
+        _validate_bounded_text(obligation, "obligation", OBLIGATION_MAX_LEN)
+
+        if not _is_valid_address(client):
+            raise gl.vm.UserError("client must be a valid, non-zero address")
+        if not _is_valid_address(contractor):
+            raise gl.vm.UserError("contractor must be a valid, non-zero address")
+
+        if constitution_id not in self.constitutions:
+            raise gl.vm.UserError("constitution_id does not exist")
+        constitution = json.loads(self.constitutions[constitution_id])
+        if constitution["status"] != "ACTIVE":
+            raise gl.vm.UserError("constitution must be ACTIVE")
+
+        if settlement_policy_id not in self.settlement_policies:
+            raise gl.vm.UserError("settlement_policy_id does not exist")
+        settlement_policy = json.loads(self.settlement_policies[settlement_policy_id])
+        if settlement_policy["status"] != "ACTIVE":
+            raise gl.vm.UserError("settlement_policy must be ACTIVE")
+
+        _validate_timestamp(baseline_window_start, "baseline_window_start")
+        _validate_timestamp(baseline_window_end, "baseline_window_end")
+        _validate_timestamp(observation_window_start, "observation_window_start")
+        _validate_timestamp(observation_window_end, "observation_window_end")
+
+        if baseline_window_start >= baseline_window_end:
+            raise gl.vm.UserError("baseline_window_start must be before baseline_window_end")
+        if observation_window_start >= observation_window_end:
+            raise gl.vm.UserError("observation_window_start must be before observation_window_end")
+        if baseline_window_end > observation_window_start:
+            raise gl.vm.UserError("baseline window must finish before observation window begins")
+
+        if isinstance(escrow_amount, bool) or not isinstance(escrow_amount, int):
+            raise gl.vm.UserError("escrow_amount must be an integer")
+        if escrow_amount < 0 or escrow_amount > ESCROW_AMOUNT_MAX:
+            raise gl.vm.UserError(f"escrow_amount must be between 0 and {ESCROW_AMOUNT_MAX}")
 
         record = {
             "agreement_id": agreement_id,
@@ -111,18 +262,19 @@ class Lacuna(gl.Contract):
             "contractor": contractor,
             "title": title,
             "obligation": obligation,
-            "constitution_id": "",
-            "settlement_policy_id": "",
-            "baseline_window_start": "",
-            "baseline_window_end": "",
-            "observation_window_start": "",
-            "observation_window_end": "",
+            "constitution_id": constitution_id,
+            "settlement_policy_id": settlement_policy_id,
+            "baseline_window_start": baseline_window_start,
+            "baseline_window_end": baseline_window_end,
+            "observation_window_start": observation_window_start,
+            "observation_window_end": observation_window_end,
             "status": "DRAFT",
-            "escrow_amount": "0",
+            "escrow_amount": escrow_amount,
             "baseline_id": "",
             "verdict_id": "",
             "appeal_id": "",
             "created_by": gl.message.sender_address.as_hex,
+            "created_at": datetime.now().isoformat(),
         }
         self.agreements[agreement_id] = json.dumps(record)
         self.agreement_baseline_evidence_ids[agreement_id] = json.dumps([])
@@ -142,4 +294,214 @@ class Lacuna(gl.Contract):
         result = []
         for agreement_id in self.agreements:
             result.append(json.loads(self.agreements[agreement_id]))
+        return json.dumps(result)
+
+    # =========================================================
+    # BaselineConstitution (spec section 14/6 / brief section 4+8)
+    # =========================================================
+
+    @gl.public.write
+    def create_baseline_constitution(
+        self,
+        name: str,
+        primary_metric: str,
+        supporting_metric_schema: list[str],
+        guardrail_metric_schema: list[str],
+        baseline_method: str,
+        minimum_evidence_categories: list[str],
+        minimum_independent_sources: int,
+        external_shock_policy: str,
+        attribution_rules: list[str],
+        falsification_rules: list[str],
+    ) -> str:
+        _validate_bounded_text(name, "name", NAME_MAX_LEN)
+        _validate_bounded_text(primary_metric, "primary_metric", METRIC_NAME_MAX_LEN)
+        _validate_bounded_text(baseline_method, "baseline_method", METHOD_MAX_LEN)
+        _validate_bounded_text(external_shock_policy, "external_shock_policy", SHOCK_POLICY_MAX_LEN)
+
+        _validate_metric_schema(supporting_metric_schema, "supporting_metric_schema")
+        _validate_metric_schema(guardrail_metric_schema, "guardrail_metric_schema")
+
+        if not minimum_evidence_categories:
+            raise gl.vm.UserError("minimum_evidence_categories must not be empty")
+        if len(minimum_evidence_categories) != len(set(minimum_evidence_categories)):
+            raise gl.vm.UserError("minimum_evidence_categories must not contain duplicates")
+        for category in minimum_evidence_categories:
+            if category not in EVIDENCE_CATEGORIES:
+                allowed = ", ".join(sorted(EVIDENCE_CATEGORIES))
+                raise gl.vm.UserError(f"minimum_evidence_categories entries must be one of: {allowed}")
+
+        if isinstance(minimum_independent_sources, bool) or not isinstance(
+            minimum_independent_sources, int
+        ):
+            raise gl.vm.UserError("minimum_independent_sources must be an integer")
+        if minimum_independent_sources < 1 or minimum_independent_sources > MIN_INDEPENDENT_SOURCES_MAX:
+            raise gl.vm.UserError(
+                f"minimum_independent_sources must be between 1 and {MIN_INDEPENDENT_SOURCES_MAX}"
+            )
+
+        if not attribution_rules:
+            raise gl.vm.UserError("attribution_rules must not be empty")
+        if len(attribution_rules) > MAX_RULE_ENTRIES:
+            raise gl.vm.UserError(f"attribution_rules must have at most {MAX_RULE_ENTRIES} entries")
+        for rule in attribution_rules:
+            _validate_bounded_text(rule, "attribution_rules entry", RULE_MAX_LEN)
+
+        if not falsification_rules:
+            raise gl.vm.UserError("falsification_rules must not be empty")
+        if len(falsification_rules) != len(set(falsification_rules)):
+            raise gl.vm.UserError("falsification_rules must not contain duplicates")
+        for check in falsification_rules:
+            if check not in FALSIFICATION_CHECKS:
+                allowed = ", ".join(sorted(FALSIFICATION_CHECKS))
+                raise gl.vm.UserError(f"falsification_rules entries must be one of: {allowed}")
+
+        existing_ids = json.loads(self.constitution_versions.get(name, "[]"))
+        version = len(existing_ids) + 1
+
+        now_iso = datetime.now().isoformat()
+        seed = f"{name}|{version}|{now_iso}|{int(self.constitution_count)}"
+        constitution_id = "constitution-" + hashlib.sha256(seed.encode()).hexdigest()[:16]
+        if constitution_id in self.constitutions:
+            raise gl.vm.UserError("Constitution ID collision, please retry")
+
+        # A new version of an existing named constitution supersedes it: only
+        # the newest version of a given name is ACTIVE. Older versions become
+        # INACTIVE but are never deleted or mutated beyond this status flip,
+        # so they remain queryable by id for history (spec section 6/13).
+        if existing_ids:
+            previous_id = existing_ids[-1]
+            previous = json.loads(self.constitutions[previous_id])
+            previous["status"] = "INACTIVE"
+            self.constitutions[previous_id] = json.dumps(previous)
+
+        record = {
+            "constitution_id": constitution_id,
+            "creator": gl.message.sender_address.as_hex,
+            "name": name,
+            "version": version,
+            "primary_metric": primary_metric,
+            "supporting_metric_schema": supporting_metric_schema,
+            "guardrail_metric_schema": guardrail_metric_schema,
+            "baseline_method": baseline_method,
+            "minimum_evidence_categories": minimum_evidence_categories,
+            "minimum_independent_sources": minimum_independent_sources,
+            "external_shock_policy": external_shock_policy,
+            "attribution_rules": attribution_rules,
+            "falsification_rules": falsification_rules,
+            "status": "ACTIVE",
+            "created_at": now_iso,
+        }
+        self.constitutions[constitution_id] = json.dumps(record)
+
+        existing_ids.append(constitution_id)
+        self.constitution_versions[name] = json.dumps(existing_ids)
+        self.constitution_count = u256(int(self.constitution_count) + 1)
+
+        return constitution_id
+
+    @gl.public.view
+    def get_baseline_constitution(self, constitution_id: str) -> str:
+        if constitution_id not in self.constitutions:
+            raise gl.vm.UserError("Constitution not found")
+        return self.constitutions[constitution_id]
+
+    @gl.public.view
+    def get_constitution_versions(self, name: str) -> str:
+        return self.constitution_versions.get(name, "[]")
+
+    @gl.public.view
+    def list_constitutions(self) -> str:
+        result = []
+        for constitution_id in self.constitutions:
+            result.append(json.loads(self.constitutions[constitution_id]))
+        return json.dumps(result)
+
+    # =========================================================
+    # SettlementPolicy (spec section 14/20 / brief section 4+18)
+    # =========================================================
+
+    @gl.public.write
+    def create_settlement_policy(
+        self,
+        name: str,
+        minimum_performance_bps: int,
+        full_payment_threshold_bps: int,
+        bonus_threshold_bps: int,
+        bonus_cap_bps: int,
+        max_unresolved_confounder_bps: int,
+        guardrail_failure_cap_bps: int,
+    ) -> str:
+        _validate_bounded_text(name, "name", NAME_MAX_LEN)
+
+        _validate_bps(minimum_performance_bps, "minimum_performance_bps")
+        _validate_bps(full_payment_threshold_bps, "full_payment_threshold_bps")
+        _validate_bps(bonus_threshold_bps, "bonus_threshold_bps")
+        _validate_bps(bonus_cap_bps, "bonus_cap_bps")
+        _validate_bps(max_unresolved_confounder_bps, "max_unresolved_confounder_bps")
+        _validate_bps(guardrail_failure_cap_bps, "guardrail_failure_cap_bps")
+
+        if minimum_performance_bps > full_payment_threshold_bps:
+            raise gl.vm.UserError(
+                "minimum_performance_bps must be <= full_payment_threshold_bps"
+            )
+        if full_payment_threshold_bps > bonus_threshold_bps:
+            raise gl.vm.UserError(
+                "full_payment_threshold_bps must be <= bonus_threshold_bps"
+            )
+
+        existing_ids = json.loads(self.settlement_policy_versions.get(name, "[]"))
+        version = len(existing_ids) + 1
+
+        now_iso = datetime.now().isoformat()
+        seed = f"{name}|{version}|{now_iso}|{int(self.settlement_policy_count)}"
+        policy_id = "policy-" + hashlib.sha256(seed.encode()).hexdigest()[:16]
+        if policy_id in self.settlement_policies:
+            raise gl.vm.UserError("Settlement policy ID collision, please retry")
+
+        # Same supersede-by-name versioning as constitutions: older versions
+        # flip to INACTIVE and stay queryable, never deleted or rewritten.
+        if existing_ids:
+            previous_id = existing_ids[-1]
+            previous = json.loads(self.settlement_policies[previous_id])
+            previous["status"] = "INACTIVE"
+            self.settlement_policies[previous_id] = json.dumps(previous)
+
+        record = {
+            "policy_id": policy_id,
+            "creator": gl.message.sender_address.as_hex,
+            "name": name,
+            "version": version,
+            "minimum_performance_bps": minimum_performance_bps,
+            "full_payment_threshold_bps": full_payment_threshold_bps,
+            "bonus_threshold_bps": bonus_threshold_bps,
+            "bonus_cap_bps": bonus_cap_bps,
+            "max_unresolved_confounder_bps": max_unresolved_confounder_bps,
+            "guardrail_failure_cap_bps": guardrail_failure_cap_bps,
+            "status": "ACTIVE",
+            "created_at": now_iso,
+        }
+        self.settlement_policies[policy_id] = json.dumps(record)
+
+        existing_ids.append(policy_id)
+        self.settlement_policy_versions[name] = json.dumps(existing_ids)
+        self.settlement_policy_count = u256(int(self.settlement_policy_count) + 1)
+
+        return policy_id
+
+    @gl.public.view
+    def get_settlement_policy(self, policy_id: str) -> str:
+        if policy_id not in self.settlement_policies:
+            raise gl.vm.UserError("Settlement policy not found")
+        return self.settlement_policies[policy_id]
+
+    @gl.public.view
+    def get_settlement_policy_versions(self, name: str) -> str:
+        return self.settlement_policy_versions.get(name, "[]")
+
+    @gl.public.view
+    def list_settlement_policies(self) -> str:
+        result = []
+        for policy_id in self.settlement_policies:
+            result.append(json.loads(self.settlement_policies[policy_id]))
         return json.dumps(result)
