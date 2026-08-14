@@ -7,6 +7,12 @@ async function read(method: string, args: ContractValue[] = []): Promise<string>
   try {
     return String(await readClient.readContract({ address: LACUNA_CONTRACT_ADDRESS, functionName: method, args }));
   } catch (error) {
+    // StudioNet returns a generic gen_call execution failure for missing
+    // records. Getter calls are ID lookups, so expose the documented user
+    // outcome instead of an opaque SDK error.
+    if (method.startsWith("get_")) {
+      throw new Error("The requested LACUNA record does not exist.");
+    }
     throw normalizeGenLayerError(error);
   }
 }
