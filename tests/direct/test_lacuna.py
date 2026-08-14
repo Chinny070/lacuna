@@ -1684,3 +1684,527 @@ def test_accept_baseline_rejects_unauthorized_party(
     direct_vm.sender = direct_charlie
     with pytest.raises(Exception, match="client or contractor"):
         lacuna.accept_baseline(agreement_id)
+
+
+# =========================================================
+# Observation lifecycle, outcome evidence, alternative
+# explanations (Stage 6)
+# =========================================================
+
+
+def _finalized_agreement(lacuna, direct_vm, direct_alice, direct_bob, agreement_id="AGR-1"):
+    """Agreement with a FINAL, dual-accepted baseline. BASELINE_FINAL,
+    ready for start_observation()."""
+    agreement_id, baseline_id = _proposed_agreement(lacuna, direct_vm, direct_alice, direct_bob, agreement_id=agreement_id)
+    direct_vm.sender = direct_alice
+    lacuna.accept_baseline(agreement_id)
+    direct_vm.sender = direct_bob
+    lacuna.accept_baseline(agreement_id)
+    return agreement_id, baseline_id
+
+
+def _observing_agreement(lacuna, direct_vm, direct_alice, direct_bob, agreement_id="AGR-1"):
+    """Agreement in OBSERVING status, ready for outcome evidence /
+    alternative explanation submission."""
+    agreement_id, baseline_id = _finalized_agreement(lacuna, direct_vm, direct_alice, direct_bob, agreement_id=agreement_id)
+    direct_vm.sender = direct_alice
+    lacuna.start_observation(agreement_id)
+    return agreement_id, baseline_id
+
+
+def submit_outcome(
+    lacuna,
+    agreement_id="AGR-1",
+    evidence_id="OUT-1",
+    source_type="PUBLIC_ANALYTICS",
+    source_url="https://analytics.example.com/outcome-report",
+    content_hash=None,
+    summary="Post-intervention churn dashboard export for the observation window.",
+    metric_ref="monthly_churn_bps",
+    observed_value_bps=1200,
+    period_start=OBSERVATION_START + 100,
+    period_end=OBSERVATION_START + 200,
+):
+    if content_hash is None:
+        content_hash = _hash_of(evidence_id + source_url)
+    return lacuna.submit_outcome_evidence(
+        evidence_id,
+        agreement_id,
+        source_type,
+        source_url,
+        content_hash,
+        summary,
+        metric_ref,
+        observed_value_bps,
+        period_start,
+        period_end,
+    )
+
+
+def _submit_full_outcome_evidence_set(lacuna, agreement_id):
+    """Primary metric + both guardrail metrics covered, 3 items total --
+    satisfies freeze_resolution's minimum-evidence, primary-metric, and
+    guardrail-coverage requirements."""
+    submit_outcome(
+        lacuna,
+        agreement_id=agreement_id,
+        evidence_id="OUT-1",
+        source_url="https://analytics.example.com/churn",
+        metric_ref="monthly_churn_bps",
+        observed_value_bps=1200,
+        period_start=OBSERVATION_START + 100,
+        period_end=OBSERVATION_START + 200,
+    )
+    submit_outcome(
+        lacuna,
+        agreement_id=agreement_id,
+        evidence_id="OUT-2",
+        source_url="https://community.example.org/retention",
+        metric_ref="contributor_retention",
+        observed_value_bps=6700,
+        period_start=OBSERVATION_START + 300,
+        period_end=OBSERVATION_START + 400,
+    )
+    submit_outcome(
+        lacuna,
+        agreement_id=agreement_id,
+        evidence_id="OUT-3",
+        source_url="https://community.example.org/activity",
+        metric_ref="member_activity",
+        observed_value_bps=5400,
+        period_start=OBSERVATION_START + 500,
+        period_end=OBSERVATION_START + 600,
+    )
+
+
+def submit_explanation(
+    lacuna,
+    agreement_id="AGR-1",
+    explanation_id="EXP-1",
+    explanation_type="PRODUCT_LAUNCH",
+    statement="A major product update shipped mid-window and likely affected churn independently.",
+    evidence_refs=None,
+    affected_metrics=None,
+    direction="POSITIVE",
+    proposed_strength_bps=3000,
+):
+    if evidence_refs is None:
+        evidence_refs = []
+    if affected_metrics is None:
+        affected_metrics = ["monthly_churn_bps"]
+    return lacuna.submit_alternative_explanation(
+        explanation_id,
+        agreement_id,
+        explanation_type,
+        statement,
+        evidence_refs,
+        affected_metrics,
+        direction,
+        proposed_strength_bps,
+    )
+
+
+def test_start_observation_cannot_start_before_baseline_final(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _proposed_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+
+    with pytest.raises(Exception, match="BASELINE_FINAL"):
+        lacuna.start_observation(agreement_id)
+
+
+def test_start_observation_valid(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, baseline_id = _finalized_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+
+    result = json.loads(lacuna.start_observation(agreement_id))
+    assert result["status"] == "OBSERVING"
+
+    agreement = json.loads(lacuna.get_agreement(agreement_id))
+    assert agreement["status"] == "OBSERVING"
+    assert agreement["baseline_id"] == baseline_id
+
+
+def test_start_observation_leaves_finalized_baseline_unchanged(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, baseline_id = _finalized_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    before = json.loads(lacuna.get_counterfactual_baseline(baseline_id))
+
+    direct_vm.sender = direct_alice
+    lacuna.start_observation(agreement_id)
+
+    after = json.loads(lacuna.get_counterfactual_baseline(baseline_id))
+    assert after == before
+    assert after["status"] == "FINAL"
+
+
+def test_submit_outcome_evidence_valid(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _observing_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+
+    evidence_id = submit_outcome(lacuna, agreement_id=agreement_id)
+    assert evidence_id == "OUT-1"
+    assert lacuna.outcome_evidence_count == 1
+
+    record = json.loads(lacuna.get_outcome_evidence("OUT-1"))
+    assert record["agreement_id"] == agreement_id
+    assert record["metric_ref"] == "monthly_churn_bps"
+    assert record["observed_value_bps"] == 1200
+    assert record["status"] == "SUBMITTED"
+    assert record["source_host"] == "analytics.example.com"
+
+    listed = json.loads(lacuna.list_outcome_evidence(agreement_id))
+    assert len(listed) == 1
+
+    agreement = json.loads(lacuna.get_agreement(agreement_id))
+    assert agreement["status"] == "RESOLUTION_OPEN"
+
+
+def test_submit_outcome_evidence_rejects_invalid_source_type(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _observing_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception, match="source_type"):
+        submit_outcome(lacuna, agreement_id=agreement_id, source_type="NOT_A_REAL_CATEGORY")
+
+
+def test_submit_outcome_evidence_rejects_invalid_url(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _observing_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception, match="source_url"):
+        submit_outcome(lacuna, agreement_id=agreement_id, source_url="not-a-url")
+
+
+def test_submit_outcome_evidence_rejects_invalid_content_hash(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _observing_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception, match="content_hash"):
+        submit_outcome(lacuna, agreement_id=agreement_id, content_hash="not-a-hash")
+
+
+def test_submit_outcome_evidence_rejects_invalid_metric(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _observing_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception, match="metric_ref"):
+        submit_outcome(lacuna, agreement_id=agreement_id, metric_ref="not_in_constitution")
+
+
+def test_submit_outcome_evidence_rejects_invalid_observed_bps(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _observing_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception, match="observed_value_bps"):
+        submit_outcome(lacuna, agreement_id=agreement_id, observed_value_bps=10001)
+
+
+def test_submit_outcome_evidence_rejects_invalid_period(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _observing_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception, match="period_start must be before period_end"):
+        submit_outcome(lacuna, agreement_id=agreement_id, period_start=OBSERVATION_START + 200, period_end=OBSERVATION_START + 100)
+
+
+def test_submit_outcome_evidence_rejects_period_outside_observation_window(
+    direct_deploy, direct_vm, direct_alice, direct_bob
+):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _observing_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception, match="observation window"):
+        submit_outcome(lacuna, agreement_id=agreement_id, period_start=BASELINE_START, period_end=BASELINE_START + 100)
+
+
+def test_submit_outcome_evidence_rejects_duplicate_evidence_id(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _observing_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    submit_outcome(lacuna, agreement_id=agreement_id, evidence_id="OUT-1")
+
+    with pytest.raises(Exception, match="already exists"):
+        submit_outcome(lacuna, agreement_id=agreement_id, evidence_id="OUT-1", source_url="https://analytics.example.com/other")
+
+
+def test_submit_outcome_evidence_rejects_duplicate_content_hash(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _observing_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    shared_hash = _hash_of("shared-outcome-content")
+    submit_outcome(lacuna, agreement_id=agreement_id, evidence_id="OUT-1", content_hash=shared_hash)
+
+    with pytest.raises(Exception, match="Duplicate evidence"):
+        submit_outcome(
+            lacuna,
+            agreement_id=agreement_id,
+            evidence_id="OUT-2",
+            source_url="https://analytics.example.com/other",
+            content_hash=shared_hash,
+        )
+
+
+def test_submit_outcome_evidence_cap_enforced(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _observing_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+
+    for i in range(48):
+        submit_outcome(
+            lacuna,
+            agreement_id=agreement_id,
+            evidence_id=f"OUT-{i}",
+            source_url=f"https://analytics.example.com/outcome-{i}",
+            period_start=OBSERVATION_START + i * 10,
+            period_end=OBSERVATION_START + i * 10 + 5,
+        )
+
+    assert lacuna.outcome_evidence_count == 48
+
+    with pytest.raises(Exception, match="cap reached"):
+        submit_outcome(
+            lacuna,
+            agreement_id=agreement_id,
+            evidence_id="OUT-overflow",
+            source_url="https://analytics.example.com/outcome-overflow",
+            period_start=OBSERVATION_START + 10000,
+            period_end=OBSERVATION_START + 10005,
+        )
+
+
+def test_submit_alternative_explanation_valid(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _observing_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    submit_outcome(lacuna, agreement_id=agreement_id, evidence_id="OUT-1")
+
+    explanation_id = submit_explanation(
+        lacuna, agreement_id=agreement_id, evidence_refs=["OUT-1"], affected_metrics=["monthly_churn_bps"]
+    )
+    assert explanation_id == "EXP-1"
+    assert lacuna.alternative_explanation_count == 1
+
+    record = json.loads(lacuna.get_alternative_explanation("EXP-1"))
+    assert record["explanation_type"] == "PRODUCT_LAUNCH"
+    assert record["evidence_refs"] == ["OUT-1"]
+    assert record["affected_metrics"] == ["monthly_churn_bps"]
+    assert record["direction"] == "POSITIVE"
+    assert record["proposed_strength_bps"] == 3000
+    assert record["status"] == "SUBMITTED"
+
+    listed = json.loads(lacuna.list_explanations(agreement_id))
+    assert len(listed) == 1
+    assert listed[0]["explanation_id"] == "EXP-1"
+
+
+def test_submit_alternative_explanation_can_cite_frozen_baseline_evidence(
+    direct_deploy, direct_vm, direct_alice, direct_bob
+):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _observing_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+
+    # EV-1/EV-2 are the frozen baseline evidence submitted during
+    # _ready_for_baseline_evaluation -- citing pre-trend evidence from
+    # before the observation window is a legitimate explanation design.
+    explanation_id = submit_explanation(
+        lacuna,
+        agreement_id=agreement_id,
+        explanation_type="SEASONALITY",
+        evidence_refs=["EV-1"],
+        affected_metrics=["monthly_churn_bps"],
+    )
+    record = json.loads(lacuna.get_alternative_explanation(explanation_id))
+    assert record["evidence_refs"] == ["EV-1"]
+
+
+def test_submit_alternative_explanation_rejects_unsupported_type(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _observing_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception, match="explanation_type"):
+        submit_explanation(lacuna, agreement_id=agreement_id, explanation_type="NOT_A_REAL_TYPE")
+
+
+def test_submit_alternative_explanation_rejects_invalid_strength(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _observing_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception, match="proposed_strength_bps"):
+        submit_explanation(lacuna, agreement_id=agreement_id, proposed_strength_bps=10001)
+
+
+def test_submit_alternative_explanation_rejects_invalid_affected_metric(
+    direct_deploy, direct_vm, direct_alice, direct_bob
+):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _observing_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception, match="affected_metrics"):
+        submit_explanation(lacuna, agreement_id=agreement_id, affected_metrics=["not_a_real_metric"])
+
+
+def test_submit_alternative_explanation_rejects_invalid_evidence_ref(
+    direct_deploy, direct_vm, direct_alice, direct_bob
+):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _observing_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception, match="evidence_refs references evidence outside"):
+        submit_explanation(lacuna, agreement_id=agreement_id, evidence_refs=["does-not-exist"])
+
+
+def test_submit_alternative_explanation_rejects_duplicate_evidence_refs(
+    direct_deploy, direct_vm, direct_alice, direct_bob
+):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _observing_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception, match="duplicate references"):
+        submit_explanation(lacuna, agreement_id=agreement_id, evidence_refs=["EV-1", "EV-1"])
+
+
+def test_submitted_explanation_is_only_a_claim_not_authoritative(direct_deploy, direct_vm, direct_alice, direct_bob):
+    """proposed_strength_bps must be stored as the submitter's assertion
+    only -- nothing in submit_alternative_explanation writes it anywhere
+    that represents adjudicated attribution (no AttributionVerdict exists
+    yet; that is Stage 7). This test asserts the explanation record itself
+    carries no adjudication fields and the agreement/baseline are untouched."""
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, baseline_id = _observing_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    baseline_before = json.loads(lacuna.get_counterfactual_baseline(baseline_id))
+    agreement_before = json.loads(lacuna.get_agreement(agreement_id))
+
+    direct_vm.sender = direct_alice
+    submit_explanation(lacuna, agreement_id=agreement_id, proposed_strength_bps=9999)
+
+    baseline_after = json.loads(lacuna.get_counterfactual_baseline(baseline_id))
+    agreement_after = json.loads(lacuna.get_agreement(agreement_id))
+    assert baseline_after == baseline_before
+    # only the ordinary lazy OBSERVING -> RESOLUTION_OPEN lifecycle
+    # transition may occur -- nothing else about the agreement changes,
+    # and no verdict of any kind is created from an explanation alone.
+    assert agreement_before["status"] == "OBSERVING"
+    assert agreement_after["status"] == "RESOLUTION_OPEN"
+    assert agreement_after["baseline_id"] == agreement_before["baseline_id"]
+    assert lacuna.verdict_count == 0
+
+
+def test_freeze_resolution_succeeds(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, baseline_id = _observing_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    _submit_full_outcome_evidence_set(lacuna, agreement_id)
+    submit_explanation(lacuna, agreement_id=agreement_id, evidence_refs=["OUT-1"])
+
+    result = lacuna.freeze_resolution(agreement_id)
+    assert result == agreement_id
+
+    agreement = json.loads(lacuna.get_agreement(agreement_id))
+    assert agreement["status"] == "RESOLUTION_FROZEN"
+
+    evidence = json.loads(lacuna.list_outcome_evidence(agreement_id))
+    assert len(evidence) == 3
+    assert all(item["status"] == "FROZEN" for item in evidence)
+
+    explanations = json.loads(lacuna.list_explanations(agreement_id))
+    assert len(explanations) == 1
+    assert explanations[0]["status"] == "FROZEN"
+
+    # finalized baseline preserved untouched
+    baseline = json.loads(lacuna.get_counterfactual_baseline(baseline_id))
+    assert baseline["status"] == "FINAL"
+    assert baseline["expected_value_bps"] == 3400
+
+
+def test_freeze_resolution_without_primary_metric_evidence_rejected(
+    direct_deploy, direct_vm, direct_alice, direct_bob
+):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _observing_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    submit_outcome(
+        lacuna, agreement_id=agreement_id, evidence_id="OUT-1",
+        source_url="https://community.example.org/retention", metric_ref="contributor_retention",
+    )
+    submit_outcome(
+        lacuna, agreement_id=agreement_id, evidence_id="OUT-2",
+        source_url="https://community.example.org/activity", metric_ref="member_activity",
+        period_start=OBSERVATION_START + 300, period_end=OBSERVATION_START + 400,
+    )
+
+    with pytest.raises(Exception, match="primary metric"):
+        lacuna.freeze_resolution(agreement_id)
+
+
+def test_freeze_resolution_requires_guardrail_evidence(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _observing_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    submit_outcome(
+        lacuna, agreement_id=agreement_id, evidence_id="OUT-1",
+        source_url="https://analytics.example.com/churn", metric_ref="monthly_churn_bps",
+    )
+    submit_outcome(
+        lacuna, agreement_id=agreement_id, evidence_id="OUT-2",
+        source_url="https://community.example.org/retention", metric_ref="contributor_retention",
+        period_start=OBSERVATION_START + 300, period_end=OBSERVATION_START + 400,
+    )
+    # member_activity guardrail never submitted
+
+    with pytest.raises(Exception, match="guardrail metric"):
+        lacuna.freeze_resolution(agreement_id)
+
+
+def test_freeze_resolution_requires_sufficient_evidence(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _observing_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    # never submits anything -- status stays OBSERVING, freeze must fail
+
+    with pytest.raises(Exception, match="RESOLUTION_OPEN"):
+        lacuna.freeze_resolution(agreement_id)
+
+
+def test_no_outcome_evidence_can_be_submitted_after_freeze(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _observing_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    _submit_full_outcome_evidence_set(lacuna, agreement_id)
+    lacuna.freeze_resolution(agreement_id)
+
+    with pytest.raises(Exception, match="OBSERVING or RESOLUTION_OPEN"):
+        submit_outcome(lacuna, agreement_id=agreement_id, evidence_id="OUT-4")
+
+
+def test_no_explanation_can_be_submitted_after_freeze(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _observing_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    _submit_full_outcome_evidence_set(lacuna, agreement_id)
+    lacuna.freeze_resolution(agreement_id)
+
+    with pytest.raises(Exception, match="OBSERVING or RESOLUTION_OPEN"):
+        submit_explanation(lacuna, agreement_id=agreement_id, explanation_id="EXP-late")
+
+
+def test_frozen_resolution_records_remain_queryable_and_immutable(
+    direct_deploy, direct_vm, direct_alice, direct_bob
+):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _observing_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    _submit_full_outcome_evidence_set(lacuna, agreement_id)
+    submit_explanation(lacuna, agreement_id=agreement_id, evidence_refs=["OUT-1"])
+    lacuna.freeze_resolution(agreement_id)
+
+    evidence = json.loads(lacuna.get_outcome_evidence("OUT-1"))
+    assert evidence["status"] == "FROZEN"
+    assert evidence["observed_value_bps"] == 1200
+
+    explanation = json.loads(lacuna.get_alternative_explanation("EXP-1"))
+    assert explanation["status"] == "FROZEN"
+    assert explanation["proposed_strength_bps"] == 3000

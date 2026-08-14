@@ -124,6 +124,41 @@ MAX_BASELINE_EVIDENCE_PER_AGREEMENT = 48
 # network-free structural validation before any adjudication (Stage 4+).
 _CONTENT_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
+# Outcome evidence bounds (Stage 6, mirrors baseline evidence bounds).
+MAX_OUTCOME_EVIDENCE_PER_AGREEMENT = 48
+
+# Alternative-explanation types (spec section 8 / brief section 13).
+# Generic on purpose -- these are causal-explanation categories, not tied
+# to one vertical.
+ALTERNATIVE_EXPLANATION_TYPES = frozenset(
+    {
+        "PRODUCT_LAUNCH",
+        "MAJOR_MARKETING_CAMPAIGN",
+        "INFLUENCER_EVENT",
+        "MARKET_WIDE_GROWTH",
+        "MARKET_WIDE_DECLINE",
+        "SEASONALITY",
+        "OTHER_TEAM_INTERVENTION",
+        "POLICY_CHANGE",
+        "PLATFORM_ALGORITHM_CHANGE",
+        "MEASUREMENT_METHOD_CHANGED",
+        "MEMBERSHIP_COMPOSITION_CHANGED",
+        "EXTERNAL_SECURITY_ENVIRONMENT_CHANGED",
+        "DATA_COLLECTION_CHANGED",
+        "RANDOM_VARIATION",
+        "UNKNOWN_CONFOUNDER",
+    }
+)
+
+EXPLANATION_DIRECTIONS = frozenset({"POSITIVE", "NEGATIVE", "MIXED", "UNKNOWN"})
+
+EXPLANATION_ID_MAX_LEN = 100
+EXPLANATION_STATEMENT_MAX_LEN = 2000
+MAX_EXPLANATION_AFFECTED_METRICS = 20
+MAX_EXPLANATIONS_PER_AGREEMENT = 48
+
+EXPLANATION_STATUSES = ("SUBMITTED", "FROZEN")
+
 # Baseline adjudication reason codes (spec section 18).
 BASELINE_POSITIVE_REASON_CODES = frozenset(
     {
@@ -1650,3 +1685,369 @@ Return this exact JSON shape:
 
         self.agreements[agreement_id] = json.dumps(agreement)
         return json.dumps(agreement)
+
+    # =========================================================
+    # Observation lifecycle, outcome evidence, alternative
+    # explanations (Stage 6). No performance adjudication here.
+    # =========================================================
+
+    @gl.public.write
+    def start_observation(self, agreement_id: str) -> str:
+        if agreement_id not in self.agreements:
+            raise gl.vm.UserError("Agreement not found")
+        agreement = json.loads(self.agreements[agreement_id])
+
+        sender = gl.message.sender_address.as_hex
+        if sender.lower() not in (agreement["client"].lower(), agreement["contractor"].lower()):
+            raise gl.vm.UserError(
+                "Only the agreement's client or contractor may start observation"
+            )
+
+        if agreement["status"] != "BASELINE_FINAL":
+            raise gl.vm.UserError(
+                "Agreement must be in BASELINE_FINAL status to start observation"
+            )
+
+        baseline_id = agreement["baseline_id"]
+        if not baseline_id or baseline_id not in self.baselines:
+            raise gl.vm.UserError("Agreement has no finalized baseline")
+        baseline = json.loads(self.baselines[baseline_id])
+        if baseline["status"] != "FINAL":
+            raise gl.vm.UserError("Baseline must be FINAL to start observation")
+
+        if not agreement["client_baseline_acceptance"] or not agreement["contractor_baseline_acceptance"]:
+            raise gl.vm.UserError("Both parties must have accepted the baseline")
+
+        # Locked-reference invariants: neither pointer is ever rewritten by
+        # any write method in this contract, so this is a defensive
+        # existence check, not a mutation guard.
+        if agreement["constitution_id"] not in self.constitutions:
+            raise gl.vm.UserError("Agreement's constitution reference is invalid")
+        if agreement["settlement_policy_id"] not in self.settlement_policies:
+            raise gl.vm.UserError("Agreement's settlement policy reference is invalid")
+
+        # The finalized baseline itself is never written to here.
+        agreement["status"] = "OBSERVING"
+        self.agreements[agreement_id] = json.dumps(agreement)
+        return json.dumps(agreement)
+
+    def _locked_metric_set(self, agreement: dict) -> set:
+        constitution = json.loads(self.constitutions[agreement["constitution_id"]])
+        return (
+            {constitution["primary_metric"]}
+            | set(constitution["supporting_metric_schema"])
+            | set(constitution["guardrail_metric_schema"])
+        )
+
+    @gl.public.write
+    def submit_outcome_evidence(
+        self,
+        evidence_id: str,
+        agreement_id: str,
+        source_type: str,
+        source_url: str,
+        content_hash: str,
+        summary: str,
+        metric_ref: str,
+        observed_value_bps: int,
+        period_start: int,
+        period_end: int,
+    ) -> str:
+        if not evidence_id or len(evidence_id) > EVIDENCE_ID_MAX_LEN:
+            raise gl.vm.UserError(f"evidence_id must be 1-{EVIDENCE_ID_MAX_LEN} characters")
+        if evidence_id in self.outcome_evidence:
+            raise gl.vm.UserError("Outcome evidence ID already exists")
+
+        if agreement_id not in self.agreements:
+            raise gl.vm.UserError("Agreement not found")
+        agreement = json.loads(self.agreements[agreement_id])
+
+        # Resolution evidence collection is open from OBSERVING through the
+        # explicit RESOLUTION_OPEN state; the first submission lazily
+        # advances OBSERVING -> RESOLUTION_OPEN, the same lazy-transition
+        # pattern used for baseline evidence (DRAFT -> BASELINE_OPEN).
+        if agreement["status"] not in ("OBSERVING", "RESOLUTION_OPEN"):
+            raise gl.vm.UserError(
+                "Agreement must be in OBSERVING or RESOLUTION_OPEN status to accept outcome evidence"
+            )
+
+        sender = gl.message.sender_address.as_hex
+        if sender.lower() not in (agreement["client"].lower(), agreement["contractor"].lower()):
+            raise gl.vm.UserError(
+                "Only the agreement's client or contractor may submit outcome evidence"
+            )
+
+        if source_type not in EVIDENCE_CATEGORIES:
+            allowed = ", ".join(sorted(EVIDENCE_CATEGORIES))
+            raise gl.vm.UserError(f"source_type must be one of: {allowed}")
+
+        source_host = _validate_source_url(source_url)
+        _validate_content_hash(content_hash)
+        _validate_bounded_text(summary, "summary", SUMMARY_MAX_LEN)
+
+        allowed_metrics = self._locked_metric_set(agreement)
+        if metric_ref not in allowed_metrics:
+            raise gl.vm.UserError(
+                "metric_ref must match the agreement's locked constitution "
+                "(primary, supporting, or guardrail metric)"
+            )
+
+        _validate_bps(observed_value_bps, "observed_value_bps")
+
+        _validate_timestamp(period_start, "period_start")
+        _validate_timestamp(period_end, "period_end")
+        if period_start >= period_end:
+            raise gl.vm.UserError("period_start must be before period_end")
+        if period_start < agreement["observation_window_start"] or period_end > agreement["observation_window_end"]:
+            raise gl.vm.UserError(
+                "Evidence period must fall entirely within the agreement's observation window"
+            )
+
+        evidence_ids = json.loads(self.agreement_outcome_evidence_ids[agreement_id])
+        if len(evidence_ids) >= MAX_OUTCOME_EVIDENCE_PER_AGREEMENT:
+            raise gl.vm.UserError(
+                f"Outcome evidence cap reached ({MAX_OUTCOME_EVIDENCE_PER_AGREEMENT})"
+            )
+
+        norm_url = source_url.strip().lower()
+        for existing_id in evidence_ids:
+            existing = json.loads(self.outcome_evidence[existing_id])
+            if existing["content_hash"] == content_hash:
+                raise gl.vm.UserError("Duplicate evidence: content_hash already submitted for this agreement")
+            existing_url = existing["source_url"].strip().lower()
+            if (
+                existing_url == norm_url
+                and existing["metric_ref"] == metric_ref
+                and existing["period_start"] == period_start
+                and existing["period_end"] == period_end
+            ):
+                raise gl.vm.UserError(
+                    "Duplicate evidence: same source_url, metric_ref, and period already submitted"
+                )
+
+        record = {
+            "evidence_id": evidence_id,
+            "agreement_id": agreement_id,
+            "submitter": sender,
+            "source_type": source_type,
+            "source_url": source_url,
+            "source_host": source_host,
+            "content_hash": content_hash,
+            "summary": summary,
+            "metric_ref": metric_ref,
+            "observed_value_bps": int(observed_value_bps),
+            "period_start": period_start,
+            "period_end": period_end,
+            "submitted_at": datetime.now().isoformat(),
+            "status": "SUBMITTED",
+        }
+        self.outcome_evidence[evidence_id] = json.dumps(record)
+
+        evidence_ids.append(evidence_id)
+        self.agreement_outcome_evidence_ids[agreement_id] = json.dumps(evidence_ids)
+        self.outcome_evidence_count = u256(int(self.outcome_evidence_count) + 1)
+
+        if agreement["status"] == "OBSERVING":
+            agreement["status"] = "RESOLUTION_OPEN"
+            self.agreements[agreement_id] = json.dumps(agreement)
+
+        return evidence_id
+
+    @gl.public.view
+    def get_outcome_evidence(self, evidence_id: str) -> str:
+        if evidence_id not in self.outcome_evidence:
+            raise gl.vm.UserError("Outcome evidence not found")
+        return self.outcome_evidence[evidence_id]
+
+    @gl.public.view
+    def list_outcome_evidence(self, agreement_id: str) -> str:
+        if agreement_id not in self.agreements:
+            raise gl.vm.UserError("Agreement not found")
+        evidence_ids = json.loads(self.agreement_outcome_evidence_ids[agreement_id])
+        return json.dumps([json.loads(self.outcome_evidence[eid]) for eid in evidence_ids])
+
+    @gl.public.write
+    def submit_alternative_explanation(
+        self,
+        explanation_id: str,
+        agreement_id: str,
+        explanation_type: str,
+        statement: str,
+        evidence_refs: list[str],
+        affected_metrics: list[str],
+        direction: str,
+        proposed_strength_bps: int,
+    ) -> str:
+        # Competing explanations are first-class, independently queryable
+        # records (spec section 8/brief section 13) -- never free-text
+        # notes folded into an OutcomeEvidence entry.
+        if not explanation_id or len(explanation_id) > EXPLANATION_ID_MAX_LEN:
+            raise gl.vm.UserError(f"explanation_id must be 1-{EXPLANATION_ID_MAX_LEN} characters")
+        if explanation_id in self.alternative_explanations:
+            raise gl.vm.UserError("Alternative explanation ID already exists")
+
+        if agreement_id not in self.agreements:
+            raise gl.vm.UserError("Agreement not found")
+        agreement = json.loads(self.agreements[agreement_id])
+
+        if agreement["status"] not in ("OBSERVING", "RESOLUTION_OPEN"):
+            raise gl.vm.UserError(
+                "Agreement must be in OBSERVING or RESOLUTION_OPEN status to submit an alternative explanation"
+            )
+
+        sender = gl.message.sender_address.as_hex
+        if sender.lower() not in (agreement["client"].lower(), agreement["contractor"].lower()):
+            raise gl.vm.UserError(
+                "Only the agreement's client or contractor may submit an alternative explanation"
+            )
+
+        if explanation_type not in ALTERNATIVE_EXPLANATION_TYPES:
+            allowed = ", ".join(sorted(ALTERNATIVE_EXPLANATION_TYPES))
+            raise gl.vm.UserError(f"explanation_type must be one of: {allowed}")
+
+        _validate_bounded_text(statement, "statement", EXPLANATION_STATEMENT_MAX_LEN)
+
+        if len(evidence_refs) != len(set(evidence_refs)):
+            raise gl.vm.UserError("evidence_refs must not contain duplicate references")
+        # An explanation may point at either the frozen baseline evidence
+        # (e.g. to show a pre-trend already visible before observation) or
+        # the outcome evidence submitted so far (e.g. to show a product
+        # launch date) -- both pools are already immutable-once-frozen and
+        # agreement-scoped, so citing either is a legitimate design choice.
+        valid_evidence_refs = set(
+            json.loads(self.agreement_baseline_evidence_ids[agreement_id])
+        ) | set(json.loads(self.agreement_outcome_evidence_ids[agreement_id]))
+        for ref in evidence_refs:
+            if ref not in valid_evidence_refs:
+                raise gl.vm.UserError(
+                    f"evidence_refs references evidence outside this agreement's baseline "
+                    f"or outcome evidence: {ref}"
+                )
+
+        if not affected_metrics:
+            raise gl.vm.UserError("affected_metrics must not be empty")
+        if len(affected_metrics) > MAX_EXPLANATION_AFFECTED_METRICS:
+            raise gl.vm.UserError(
+                f"affected_metrics must have at most {MAX_EXPLANATION_AFFECTED_METRICS} entries"
+            )
+        if len(affected_metrics) != len(set(affected_metrics)):
+            raise gl.vm.UserError("affected_metrics must not contain duplicates")
+        allowed_metrics = self._locked_metric_set(agreement)
+        for metric in affected_metrics:
+            if metric not in allowed_metrics:
+                raise gl.vm.UserError(
+                    f"affected_metrics entries must match the agreement's locked "
+                    f"constitution (primary, supporting, or guardrail metric): {metric}"
+                )
+
+        if direction not in EXPLANATION_DIRECTIONS:
+            allowed = ", ".join(sorted(EXPLANATION_DIRECTIONS))
+            raise gl.vm.UserError(f"direction must be one of: {allowed}")
+
+        # proposed_strength_bps is only the submitter's own asserted
+        # strength -- it is stored verbatim as a claim and never treated as
+        # authoritative attribution. Actual confounder strength is decided
+        # by GenLayer adjudication in Stage 7, not by this method.
+        _validate_bps(proposed_strength_bps, "proposed_strength_bps")
+
+        explanation_ids = json.loads(self.agreement_explanation_ids[agreement_id])
+        if len(explanation_ids) >= MAX_EXPLANATIONS_PER_AGREEMENT:
+            raise gl.vm.UserError(
+                f"Alternative explanation cap reached ({MAX_EXPLANATIONS_PER_AGREEMENT})"
+            )
+
+        record = {
+            "explanation_id": explanation_id,
+            "agreement_id": agreement_id,
+            "submitter": sender,
+            "explanation_type": explanation_type,
+            "statement": statement,
+            "evidence_refs": evidence_refs,
+            "affected_metrics": affected_metrics,
+            "direction": direction,
+            "proposed_strength_bps": int(proposed_strength_bps),
+            "status": "SUBMITTED",
+            "submitted_at": datetime.now().isoformat(),
+        }
+        self.alternative_explanations[explanation_id] = json.dumps(record)
+
+        explanation_ids.append(explanation_id)
+        self.agreement_explanation_ids[agreement_id] = json.dumps(explanation_ids)
+        self.alternative_explanation_count = u256(int(self.alternative_explanation_count) + 1)
+
+        if agreement["status"] == "OBSERVING":
+            agreement["status"] = "RESOLUTION_OPEN"
+            self.agreements[agreement_id] = json.dumps(agreement)
+
+        return explanation_id
+
+    @gl.public.view
+    def get_alternative_explanation(self, explanation_id: str) -> str:
+        if explanation_id not in self.alternative_explanations:
+            raise gl.vm.UserError("Alternative explanation not found")
+        return self.alternative_explanations[explanation_id]
+
+    @gl.public.view
+    def list_explanations(self, agreement_id: str) -> str:
+        if agreement_id not in self.agreements:
+            raise gl.vm.UserError("Agreement not found")
+        explanation_ids = json.loads(self.agreement_explanation_ids[agreement_id])
+        return json.dumps([json.loads(self.alternative_explanations[eid]) for eid in explanation_ids])
+
+    @gl.public.write
+    def freeze_resolution(self, agreement_id: str) -> str:
+        if agreement_id not in self.agreements:
+            raise gl.vm.UserError("Agreement not found")
+        agreement = json.loads(self.agreements[agreement_id])
+
+        if agreement["status"] != "RESOLUTION_OPEN":
+            raise gl.vm.UserError(
+                "Agreement must be in RESOLUTION_OPEN status to freeze resolution "
+                "(submit at least one outcome evidence item first)"
+            )
+
+        constitution = json.loads(self.constitutions[agreement["constitution_id"]])
+        minimum_independent_sources = constitution["minimum_independent_sources"]
+
+        evidence_ids = json.loads(self.agreement_outcome_evidence_ids[agreement_id])
+        evidence_records = [json.loads(self.outcome_evidence[eid]) for eid in evidence_ids]
+
+        if len(evidence_records) < minimum_independent_sources:
+            raise gl.vm.UserError(
+                f"Insufficient outcome evidence: at least {minimum_independent_sources} "
+                f"item(s) required, found {len(evidence_records)}"
+            )
+
+        present_metrics = {record["metric_ref"] for record in evidence_records}
+        if constitution["primary_metric"] not in present_metrics:
+            raise gl.vm.UserError(
+                f"Outcome evidence must include the primary metric: {constitution['primary_metric']}"
+            )
+
+        # Guardrail metrics are compulsory: Stage 7's guardrail check (was
+        # the primary metric improved by damaging a guardrail?) needs
+        # actual observed data for every guardrail the constitution
+        # declares. Supporting metrics are supplementary by design and are
+        # not required for freeze.
+        missing_guardrails = set(constitution["guardrail_metric_schema"]) - present_metrics
+        if missing_guardrails:
+            raise gl.vm.UserError(
+                "Outcome evidence must cover every guardrail metric, missing: "
+                + ", ".join(sorted(missing_guardrails))
+            )
+
+        for record in evidence_records:
+            record["status"] = "FROZEN"
+            self.outcome_evidence[record["evidence_id"]] = json.dumps(record)
+
+        explanation_ids = json.loads(self.agreement_explanation_ids[agreement_id])
+        for explanation_id in explanation_ids:
+            explanation = json.loads(self.alternative_explanations[explanation_id])
+            explanation["status"] = "FROZEN"
+            self.alternative_explanations[explanation_id] = json.dumps(explanation)
+
+        # The finalized baseline is never written to here.
+        agreement["status"] = "RESOLUTION_FROZEN"
+        self.agreements[agreement_id] = json.dumps(agreement)
+
+        return agreement_id
