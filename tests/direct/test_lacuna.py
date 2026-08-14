@@ -2208,3 +2208,483 @@ def test_frozen_resolution_records_remain_queryable_and_immutable(
     explanation = json.loads(lacuna.get_alternative_explanation("EXP-1"))
     assert explanation["status"] == "FROZEN"
     assert explanation["proposed_strength_bps"] == 3000
+
+
+# =========================================================
+# AttributionVerdict adjudication (Stage 7)
+# =========================================================
+
+
+def _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob, agreement_id="AGR-1"):
+    """Agreement with a full frozen resolution package -- baseline evidence,
+    outcome evidence (primary + both guardrails), one explanation -- and
+    every evidence source_url mocked. Ready for evaluate_performance()."""
+    agreement_id, baseline_id = _observing_agreement(lacuna, direct_vm, direct_alice, direct_bob, agreement_id=agreement_id)
+    direct_vm.sender = direct_alice
+    _submit_full_outcome_evidence_set(lacuna, agreement_id)
+    submit_explanation(lacuna, agreement_id=agreement_id, evidence_refs=["OUT-1"])
+    lacuna.freeze_resolution(agreement_id)
+
+    direct_vm.mock_web("analytics.example.com/churn", {"status": 200, "body": "Churn dropped sharply after the change."})
+    direct_vm.mock_web("community.example.org/retention", {"status": 200, "body": "Retention improved steadily."})
+    direct_vm.mock_web("community.example.org/activity", {"status": 200, "body": "Activity stayed healthy."})
+    return agreement_id, baseline_id
+
+
+PERFORMANCE_VERDICT_BASE = {
+    "baseline_expected_bps": 3400,
+    "baseline_low_bps": 2900,
+    "baseline_high_bps": 4100,
+    "observed_value_bps": 1200,
+    "meaningful_deviation_bps": 2200,
+    "deviation_confidence_bps": 9200,
+    "attribution_bps": 8200,
+    "evidence_confidence_bps": 9000,
+    "alternative_explanation_strength_bps": 1000,
+    "guardrail_penalty_bps": 0,
+    "performance_bps": 8200,
+    "reason_codes": ["OUTCOME_EXCEEDS_EXPECTED_RANGE", "PERSISTENCE_SUPPORTS_ATTRIBUTION", "GUARDRAILS_PRESERVED"],
+    "evidence_refs": ["OUT-1"],
+    "summary": "Outcome substantially beats the locked baseline with strong, persistent, well-corroborated evidence of contractor action.",
+}
+
+LOW_ATTRIBUTION_VERDICT = dict(
+    PERFORMANCE_VERDICT_BASE,
+    attribution_bps=1500,
+    alternative_explanation_strength_bps=8000,
+    performance_bps=1200,
+    reason_codes=["OUTCOME_EXCEEDS_EXPECTED_RANGE", "ALTERNATIVE_EXPLANATION_DOMINANT"],
+    summary="Outcome exceeds the baseline but a dominant competing explanation leaves little credible contractor attribution.",
+)
+
+NOT_OUTSIDE_BASELINE_VERDICT = dict(
+    PERFORMANCE_VERDICT_BASE,
+    meaningful_deviation_bps=0,
+    deviation_confidence_bps=9000,
+    attribution_bps=0,
+    alternative_explanation_strength_bps=0,
+    performance_bps=0,
+    reason_codes=["OUTCOME_NOT_OUTSIDE_EXPECTED_RANGE"],
+    summary="The observed value falls within the locked baseline's expected range; no meaningful deviation to attribute.",
+)
+
+PRODUCT_LAUNCH_VERDICT = dict(
+    PERFORMANCE_VERDICT_BASE,
+    attribution_bps=2000,
+    alternative_explanation_strength_bps=7500,
+    performance_bps=2000,
+    reason_codes=["OUTCOME_EXCEEDS_EXPECTED_RANGE", "PRODUCT_LAUNCH_CONFOUNDER"],
+    summary="A product launch during the window plausibly explains most of the improvement.",
+)
+
+MARKET_EFFECT_VERDICT = dict(
+    PERFORMANCE_VERDICT_BASE,
+    attribution_bps=1800,
+    alternative_explanation_strength_bps=8000,
+    performance_bps=1800,
+    reason_codes=["OUTCOME_EXCEEDS_EXPECTED_RANGE", "MARKET_EFFECT_STRONG"],
+    summary="A market-wide effect independent of the contractor dominates the observed improvement.",
+)
+
+OTHER_TEAM_VERDICT = dict(
+    PERFORMANCE_VERDICT_BASE,
+    attribution_bps=1900,
+    alternative_explanation_strength_bps=7800,
+    performance_bps=1900,
+    reason_codes=["OUTCOME_EXCEEDS_EXPECTED_RANGE", "OTHER_TEAM_EFFECT_STRONG"],
+    summary="Evidence indicates another team's intervention is the stronger explanation for the improvement.",
+)
+
+PRE_TREND_VERDICT = dict(
+    PERFORMANCE_VERDICT_BASE,
+    attribution_bps=1500,
+    alternative_explanation_strength_bps=8200,
+    performance_bps=1500,
+    reason_codes=["OUTCOME_EXCEEDS_EXPECTED_RANGE", "PRE_TREND_ALREADY_IMPROVING"],
+    summary="The metric was already trending favorably before the observation window began.",
+)
+
+MEASUREMENT_METHOD_VERDICT = dict(
+    PERFORMANCE_VERDICT_BASE,
+    deviation_confidence_bps=3000,
+    evidence_confidence_bps=2000,
+    attribution_bps=1000,
+    alternative_explanation_strength_bps=8000,
+    performance_bps=1000,
+    reason_codes=["MEASUREMENT_METHOD_CHANGED", "EVIDENCE_CONFIDENCE_LOW"],
+    summary="The measurement methodology changed between the baseline and observation windows, undermining comparability.",
+)
+
+MEMBERSHIP_COMPOSITION_VERDICT = dict(
+    PERFORMANCE_VERDICT_BASE,
+    attribution_bps=1700,
+    alternative_explanation_strength_bps=7900,
+    performance_bps=1700,
+    reason_codes=["OUTCOME_EXCEEDS_EXPECTED_RANGE", "MEMBERSHIP_COMPOSITION_CHANGED"],
+    summary="A significant shift in membership composition confounds the observed improvement.",
+)
+
+GUARDRAIL_VIOLATION_VERDICT = dict(
+    PERFORMANCE_VERDICT_BASE,
+    guardrail_penalty_bps=3000,
+    attribution_bps=8000,
+    performance_bps=5000,
+    reason_codes=["OUTCOME_EXCEEDS_EXPECTED_RANGE", "GUARDRAIL_VIOLATION"],
+    summary="The primary metric improved but guardrail metrics deteriorated materially; performance is penalized accordingly.",
+)
+
+METRIC_GAMING_VERDICT = dict(
+    PERFORMANCE_VERDICT_BASE,
+    attribution_bps=1200,
+    alternative_explanation_strength_bps=6000,
+    performance_bps=1200,
+    reason_codes=["METRIC_GAMING_SUSPECTED", "EVIDENCE_CONFIDENCE_LOW"],
+    summary="The pattern of evidence is consistent with metric gaming rather than genuine improvement.",
+)
+
+
+def test_evaluate_performance_valid_high_attribution(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, baseline_id = _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.mock_llm(r".*", _fenced(PERFORMANCE_VERDICT_BASE))
+
+    result = json.loads(lacuna.evaluate_performance(agreement_id))
+    assert result["attribution_bps"] == 8200
+    assert result["performance_bps"] == 8200
+    assert result["baseline_expected_bps"] == 3400
+    assert result["status"] == "PROPOSED"
+
+    agreement = json.loads(lacuna.get_agreement(agreement_id))
+    assert agreement["status"] == "VERDICT_PROPOSED"
+    assert agreement["verdict_id"] == result["verdict_id"]
+
+    verdict = json.loads(lacuna.get_verdict(result["verdict_id"]))
+    assert verdict["performance_bps"] == 8200
+
+
+def test_evaluate_performance_valid_low_attribution(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.mock_llm(r".*", _fenced(LOW_ATTRIBUTION_VERDICT))
+
+    result = json.loads(lacuna.evaluate_performance(agreement_id))
+    assert result["attribution_bps"] == 1500
+    assert result["reason_codes"] == ["OUTCOME_EXCEEDS_EXPECTED_RANGE", "ALTERNATIVE_EXPLANATION_DOMINANT"]
+
+
+def test_evaluate_performance_observed_outcome_not_outside_baseline(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.mock_llm(r".*", _fenced(NOT_OUTSIDE_BASELINE_VERDICT))
+
+    result = json.loads(lacuna.evaluate_performance(agreement_id))
+    assert result["reason_codes"] == ["OUTCOME_NOT_OUTSIDE_EXPECTED_RANGE"]
+    assert result["attribution_bps"] == 0
+    assert result["performance_bps"] == 0
+
+
+def test_evaluate_performance_dominant_product_launch_confounder(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.mock_llm(r".*", _fenced(PRODUCT_LAUNCH_VERDICT))
+
+    result = json.loads(lacuna.evaluate_performance(agreement_id))
+    assert "PRODUCT_LAUNCH_CONFOUNDER" in result["reason_codes"]
+    assert result["alternative_explanation_strength_bps"] == 7500
+
+
+def test_evaluate_performance_strong_market_wide_confounder(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.mock_llm(r".*", _fenced(MARKET_EFFECT_VERDICT))
+
+    result = json.loads(lacuna.evaluate_performance(agreement_id))
+    assert "MARKET_EFFECT_STRONG" in result["reason_codes"]
+
+
+def test_evaluate_performance_other_team_intervention(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.mock_llm(r".*", _fenced(OTHER_TEAM_VERDICT))
+
+    result = json.loads(lacuna.evaluate_performance(agreement_id))
+    assert "OTHER_TEAM_EFFECT_STRONG" in result["reason_codes"]
+
+
+def test_evaluate_performance_pre_trend_already_improving(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.mock_llm(r".*", _fenced(PRE_TREND_VERDICT))
+
+    result = json.loads(lacuna.evaluate_performance(agreement_id))
+    assert "PRE_TREND_ALREADY_IMPROVING" in result["reason_codes"]
+
+
+def test_evaluate_performance_measurement_methodology_changed(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.mock_llm(r".*", _fenced(MEASUREMENT_METHOD_VERDICT))
+
+    result = json.loads(lacuna.evaluate_performance(agreement_id))
+    assert "MEASUREMENT_METHOD_CHANGED" in result["reason_codes"]
+
+
+def test_evaluate_performance_membership_composition_changed(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.mock_llm(r".*", _fenced(MEMBERSHIP_COMPOSITION_VERDICT))
+
+    result = json.loads(lacuna.evaluate_performance(agreement_id))
+    assert "MEMBERSHIP_COMPOSITION_CHANGED" in result["reason_codes"]
+
+
+def test_evaluate_performance_guardrail_violation(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.mock_llm(r".*", _fenced(GUARDRAIL_VIOLATION_VERDICT))
+
+    result = json.loads(lacuna.evaluate_performance(agreement_id))
+    assert "GUARDRAIL_VIOLATION" in result["reason_codes"]
+    assert result["guardrail_penalty_bps"] == 3000
+    assert result["performance_bps"] <= result["attribution_bps"]
+
+
+def test_evaluate_performance_metric_gaming_suspected(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.mock_llm(r".*", _fenced(METRIC_GAMING_VERDICT))
+
+    result = json.loads(lacuna.evaluate_performance(agreement_id))
+    assert "METRIC_GAMING_SUSPECTED" in result["reason_codes"]
+
+
+def test_evaluate_performance_persistence_supports_attribution(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.mock_llm(r".*", _fenced(PERFORMANCE_VERDICT_BASE))
+
+    result = json.loads(lacuna.evaluate_performance(agreement_id))
+    assert "PERSISTENCE_SUPPORTS_ATTRIBUTION" in result["reason_codes"]
+
+
+def test_evaluate_performance_negative_space_case(direct_deploy, direct_vm, direct_alice, direct_bob):
+    """Negative-space guidance is textual (prompt-level), not enforced by
+    a special contract code path -- the strict schema/validation is
+    identical for a 'fewer bad outcomes' story as for a 'more good outcomes'
+    story. This asserts a negative-space-framed verdict is accepted exactly
+    like any other valid verdict, proving no special-casing is needed or done."""
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    negative_space_verdict = dict(
+        PERFORMANCE_VERDICT_BASE,
+        summary="Churn (a negative outcome) fell well below the expected range; this is treated as an "
+                "evidence-based deviation assessment, not proof a specific number of departures was prevented.",
+    )
+    direct_vm.mock_llm(r".*", _fenced(negative_space_verdict))
+
+    result = json.loads(lacuna.evaluate_performance(agreement_id))
+    assert result["status"] == "PROPOSED"
+
+
+def test_evaluate_performance_rejects_malformed_json(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.mock_llm(r".*", "not json")
+
+    with pytest.raises(Exception, match="not valid JSON"):
+        lacuna.evaluate_performance(agreement_id)
+
+
+def test_evaluate_performance_rejects_non_object_json(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.mock_llm(r".*", _fenced([1, 2, 3]))
+
+    with pytest.raises(Exception, match="expected a JSON object"):
+        lacuna.evaluate_performance(agreement_id)
+
+
+def test_evaluate_performance_rejects_missing_field(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    bad = dict(PERFORMANCE_VERDICT_BASE)
+    del bad["summary"]
+    direct_vm.mock_llm(r".*", _fenced(bad))
+
+    with pytest.raises(Exception, match="missing field 'summary'"):
+        lacuna.evaluate_performance(agreement_id)
+
+
+def test_evaluate_performance_rejects_wrong_field_type(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    bad = dict(PERFORMANCE_VERDICT_BASE, attribution_bps="high")
+    direct_vm.mock_llm(r".*", _fenced(bad))
+
+    with pytest.raises(Exception, match="attribution_bps must be an integer"):
+        lacuna.evaluate_performance(agreement_id)
+
+
+def test_evaluate_performance_rejects_bps_below_zero(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    bad = dict(PERFORMANCE_VERDICT_BASE, guardrail_penalty_bps=-1)
+    direct_vm.mock_llm(r".*", _fenced(bad))
+
+    with pytest.raises(Exception, match="guardrail_penalty_bps must be between 0 and 10000"):
+        lacuna.evaluate_performance(agreement_id)
+
+
+def test_evaluate_performance_rejects_bps_above_10000(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    bad = dict(PERFORMANCE_VERDICT_BASE, evidence_confidence_bps=10001)
+    direct_vm.mock_llm(r".*", _fenced(bad))
+
+    with pytest.raises(Exception, match="evidence_confidence_bps must be between 0 and 10000"):
+        lacuna.evaluate_performance(agreement_id)
+
+
+def test_evaluate_performance_rejects_altered_baseline_expected(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    bad = dict(PERFORMANCE_VERDICT_BASE, baseline_expected_bps=9999)
+    direct_vm.mock_llm(r".*", _fenced(bad))
+
+    with pytest.raises(Exception, match="baseline_expected_bps must exactly match the locked baseline"):
+        lacuna.evaluate_performance(agreement_id)
+
+
+def test_evaluate_performance_rejects_altered_baseline_low(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    bad = dict(PERFORMANCE_VERDICT_BASE, baseline_low_bps=1000)
+    direct_vm.mock_llm(r".*", _fenced(bad))
+
+    with pytest.raises(Exception, match="baseline_low_bps must exactly match the locked baseline"):
+        lacuna.evaluate_performance(agreement_id)
+
+
+def test_evaluate_performance_rejects_altered_baseline_high(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    bad = dict(PERFORMANCE_VERDICT_BASE, baseline_high_bps=9999)
+    direct_vm.mock_llm(r".*", _fenced(bad))
+
+    with pytest.raises(Exception, match="baseline_high_bps must exactly match the locked baseline"):
+        lacuna.evaluate_performance(agreement_id)
+
+
+def test_evaluate_performance_rejects_observed_value_unsupported_by_evidence(
+    direct_deploy, direct_vm, direct_alice, direct_bob
+):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    bad = dict(PERFORMANCE_VERDICT_BASE, observed_value_bps=5000)  # only OUT-1 (1200) supports this metric
+    direct_vm.mock_llm(r".*", _fenced(bad))
+
+    with pytest.raises(Exception, match="observed_value_bps must fall within the range reported by frozen outcome evidence"):
+        lacuna.evaluate_performance(agreement_id)
+
+
+def test_evaluate_performance_rejects_unknown_reason_code(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    bad = dict(PERFORMANCE_VERDICT_BASE, reason_codes=["NOT_A_REAL_CODE"])
+    direct_vm.mock_llm(r".*", _fenced(bad))
+
+    with pytest.raises(Exception, match="Unknown reason code: NOT_A_REAL_CODE"):
+        lacuna.evaluate_performance(agreement_id)
+
+
+def test_evaluate_performance_rejects_nonexistent_evidence_ref(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    bad = dict(PERFORMANCE_VERDICT_BASE, evidence_refs=["OUT-does-not-exist"])
+    direct_vm.mock_llm(r".*", _fenced(bad))
+
+    with pytest.raises(Exception, match="evidence_refs references evidence outside the frozen resolution package"):
+        lacuna.evaluate_performance(agreement_id)
+
+
+def test_evaluate_performance_rejects_duplicate_evidence_ref(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    bad = dict(PERFORMANCE_VERDICT_BASE, evidence_refs=["OUT-1", "OUT-1"])
+    direct_vm.mock_llm(r".*", _fenced(bad))
+
+    with pytest.raises(Exception, match="evidence_refs must not contain duplicate references"):
+        lacuna.evaluate_performance(agreement_id)
+
+
+def test_evaluate_performance_rejects_empty_summary(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    bad = dict(PERFORMANCE_VERDICT_BASE, summary="")
+    direct_vm.mock_llm(r".*", _fenced(bad))
+
+    with pytest.raises(Exception, match="summary must be 1-"):
+        lacuna.evaluate_performance(agreement_id)
+
+
+def test_evaluate_performance_rejects_oversized_summary(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    bad = dict(PERFORMANCE_VERDICT_BASE, summary="x" * 1001)
+    direct_vm.mock_llm(r".*", _fenced(bad))
+
+    with pytest.raises(Exception, match="summary must be 1-"):
+        lacuna.evaluate_performance(agreement_id)
+
+
+def test_evaluate_performance_cannot_run_before_resolution_frozen(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _observing_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    direct_vm.mock_llm(r".*", _fenced(PERFORMANCE_VERDICT_BASE))
+
+    with pytest.raises(Exception, match="RESOLUTION_FROZEN"):
+        lacuna.evaluate_performance(agreement_id)
+
+
+def test_repeated_adjudication_cannot_overwrite_proposed_verdict(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.mock_llm(r".*", _fenced(PERFORMANCE_VERDICT_BASE))
+    first = json.loads(lacuna.evaluate_performance(agreement_id))
+
+    direct_vm.mock_llm(r".*", _fenced(LOW_ATTRIBUTION_VERDICT))
+    with pytest.raises(Exception, match="RESOLUTION_FROZEN"):
+        lacuna.evaluate_performance(agreement_id)
+
+    agreement = json.loads(lacuna.get_agreement(agreement_id))
+    assert agreement["verdict_id"] == first["verdict_id"]
+    unchanged = json.loads(lacuna.get_verdict(first["verdict_id"]))
+    assert unchanged["attribution_bps"] == 8200
+
+
+def test_evaluate_performance_frozen_evidence_remains_immutable(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    outcome_before = json.loads(lacuna.list_outcome_evidence(agreement_id))
+    baseline_evidence_before = json.loads(lacuna.list_baseline_evidence(agreement_id))
+
+    direct_vm.mock_llm(r".*", _fenced(PERFORMANCE_VERDICT_BASE))
+    lacuna.evaluate_performance(agreement_id)
+
+    outcome_after = json.loads(lacuna.list_outcome_evidence(agreement_id))
+    baseline_evidence_after = json.loads(lacuna.list_baseline_evidence(agreement_id))
+    assert outcome_after == outcome_before
+    assert baseline_evidence_after == baseline_evidence_before
+
+
+def test_evaluate_performance_locked_baseline_remains_immutable(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, baseline_id = _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    baseline_before = json.loads(lacuna.get_counterfactual_baseline(baseline_id))
+
+    direct_vm.mock_llm(r".*", _fenced(PERFORMANCE_VERDICT_BASE))
+    lacuna.evaluate_performance(agreement_id)
+
+    baseline_after = json.loads(lacuna.get_counterfactual_baseline(baseline_id))
+    assert baseline_after == baseline_before
