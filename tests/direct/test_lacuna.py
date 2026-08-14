@@ -1309,3 +1309,378 @@ def test_evaluate_baseline_rejects_unknown_agreement(direct_deploy, direct_vm, d
     direct_vm.sender = direct_alice
     with pytest.raises(Exception, match="Agreement not found"):
         lacuna.evaluate_baseline("does-not-exist")
+
+
+# =========================================================
+# BaselineChallenge, acceptance, and permanent lock (Stage 5)
+# =========================================================
+
+
+UPHOLD_VERDICT = {
+    "decision": "UPHOLD",
+    "replacement_required": False,
+    "expected_value_bps": 3400,
+    "expected_low_bps": 2900,
+    "expected_high_bps": 4100,
+    "confidence_bps": 8800,
+    "reason_codes": ["HISTORICAL_TREND_SUPPORTED"],
+    "evidence_refs": ["EV-1"],
+    "summary": "The original baseline is defensible; the challenge does not identify a material flaw.",
+}
+
+MODIFY_VERDICT = {
+    "decision": "MODIFY",
+    "replacement_required": True,
+    "expected_value_bps": 3000,
+    "expected_low_bps": 2500,
+    "expected_high_bps": 3600,
+    "confidence_bps": 7000,
+    "reason_codes": ["COMPARABILITY_LOW"],
+    "evidence_refs": ["EV-1", "EV-2"],
+    "summary": "The original range ignored a comparability issue; the corrected range accounts for it.",
+}
+
+VOID_CHALLENGE_VERDICT = {
+    "decision": "VOID",
+    "replacement_required": False,
+    "expected_value_bps": 0,
+    "expected_low_bps": 0,
+    "expected_high_bps": 0,
+    "confidence_bps": 0,
+    "reason_codes": ["BASELINE_EVIDENCE_INSUFFICIENT"],
+    "evidence_refs": [],
+    "summary": "No defensible baseline can be salvaged from the available evidence given the challenge.",
+}
+
+
+def _proposed_agreement(lacuna, direct_vm, direct_alice, direct_bob, agreement_id="AGR-1"):
+    """Agreement with a valid PROPOSED baseline (EV-1/EV-2 evidence, web
+    mocks registered). Ready for open_baseline_challenge()/accept_baseline()."""
+    agreement_id = _ready_for_baseline_evaluation(lacuna, direct_vm, direct_alice, direct_bob, agreement_id=agreement_id)
+    direct_vm.mock_llm(r".*", _fenced(VALID_BASELINE_VERDICT))
+    result = json.loads(lacuna.evaluate_baseline(agreement_id))
+    direct_vm.clear_mocks()  # drop the stage-4 verdict mock so challenge tests control their own
+    direct_vm.mock_web("analytics.example.com/report", {"status": 200, "body": "Churn trended down steadily."})
+    direct_vm.mock_web("forum.example.org/thread", {"status": 200, "body": "Community sentiment stable."})
+    return agreement_id, result["baseline_id"]
+
+
+def test_open_baseline_challenge_valid(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, baseline_id = _proposed_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+
+    direct_vm.sender = direct_bob
+    challenge_id = lacuna.open_baseline_challenge(
+        "CH-1", agreement_id, "COMPARABLE_PERIOD_IGNORED", "The comparison period ignores a known confound.", ["EV-1"]
+    )
+    assert challenge_id == "CH-1"
+
+    record = json.loads(lacuna.get_baseline_challenge("CH-1"))
+    assert record["baseline_id"] == baseline_id
+    assert record["agreement_id"] == agreement_id
+    assert record["reason_code"] == "COMPARABLE_PERIOD_IGNORED"
+    assert record["status"] == "OPEN"
+    assert record["evidence_refs"] == ["EV-1"]
+
+    agreement = json.loads(lacuna.get_agreement(agreement_id))
+    assert agreement["status"] == "BASELINE_CHALLENGED"
+
+    # the proposed baseline itself remains queryable, unmutated apart from status
+    baseline = json.loads(lacuna.get_counterfactual_baseline(baseline_id))
+    assert baseline["status"] == "CHALLENGED"
+    assert baseline["expected_value_bps"] == 3400
+
+    listed = json.loads(lacuna.list_baseline_challenges(baseline_id))
+    assert len(listed) == 1
+    assert listed[0]["challenge_id"] == "CH-1"
+
+
+def test_open_baseline_challenge_rejects_unauthorized_challenger(
+    direct_deploy, direct_vm, direct_alice, direct_bob, direct_charlie
+):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _proposed_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+
+    direct_vm.sender = direct_charlie
+    with pytest.raises(Exception, match="client or contractor"):
+        lacuna.open_baseline_challenge("CH-1", agreement_id, "EVIDENCE_OMITTED", "Not my business but I object.", [])
+
+
+def test_open_baseline_challenge_rejects_wrong_agreement_status(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id = _ready_for_baseline_evaluation(lacuna, direct_vm, direct_alice, direct_bob)
+    # not yet evaluated -> still BASELINE_FROZEN
+
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception, match="BASELINE_PROPOSED"):
+        lacuna.open_baseline_challenge("CH-1", agreement_id, "EVIDENCE_OMITTED", "Too early to challenge.", [])
+
+
+def test_open_baseline_challenge_rejects_invalid_ground(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _proposed_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception, match="reason_code"):
+        lacuna.open_baseline_challenge("CH-1", agreement_id, "NOT_A_REAL_GROUND", "Statement.", [])
+
+
+def test_open_baseline_challenge_rejects_invalid_evidence_ref(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _proposed_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception, match="evidence_refs references evidence outside"):
+        lacuna.open_baseline_challenge("CH-1", agreement_id, "EVIDENCE_OMITTED", "Statement.", ["EV-does-not-exist"])
+
+
+def test_open_baseline_challenge_rejects_duplicate_evidence_ref(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _proposed_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception, match="duplicate references"):
+        lacuna.open_baseline_challenge("CH-1", agreement_id, "EVIDENCE_OMITTED", "Statement.", ["EV-1", "EV-1"])
+
+
+def test_open_baseline_challenge_rejects_duplicate_unresolved_challenge(
+    direct_deploy, direct_vm, direct_alice, direct_bob
+):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _proposed_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+
+    direct_vm.sender = direct_alice
+    lacuna.open_baseline_challenge("CH-1", agreement_id, "EVIDENCE_OMITTED", "First challenge.", [])
+
+    # A second challenge cannot be opened while the agreement/baseline is
+    # already BASELINE_CHALLENGED -- the status guard alone blocks this,
+    # which is exactly the intended enforcement of "no unresolved challenge
+    # already exists".
+    with pytest.raises(Exception, match="BASELINE_PROPOSED"):
+        lacuna.open_baseline_challenge("CH-2", agreement_id, "EVIDENCE_OMITTED", "Second challenge.", [])
+
+
+def test_evaluate_baseline_challenge_uphold(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, baseline_id = _proposed_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    lacuna.open_baseline_challenge("CH-1", agreement_id, "EVIDENCE_OMITTED", "The evaluation ignored EV-2.", ["EV-2"])
+
+    direct_vm.mock_llm(r".*", _fenced(UPHOLD_VERDICT))
+    result = json.loads(lacuna.evaluate_baseline_challenge("CH-1"))
+    assert result["status"] == "RESOLVED"
+    assert result["resolution"] == "UPHOLD"
+    assert result["replacement_baseline_id"] == ""
+
+    agreement = json.loads(lacuna.get_agreement(agreement_id))
+    assert agreement["status"] == "BASELINE_PROPOSED"
+    assert agreement["baseline_id"] == baseline_id
+
+    baseline = json.loads(lacuna.get_counterfactual_baseline(baseline_id))
+    assert baseline["status"] == "PROPOSED"
+    assert baseline["expected_value_bps"] == 3400  # unmutated
+
+
+def test_evaluate_baseline_challenge_modify(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, original_id = _proposed_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    lacuna.open_baseline_challenge("CH-1", agreement_id, "COMPARABLE_PERIOD_IGNORED", "Comparability issue.", ["EV-1", "EV-2"])
+
+    direct_vm.mock_llm(r".*", _fenced(MODIFY_VERDICT))
+    result = json.loads(lacuna.evaluate_baseline_challenge("CH-1"))
+    assert result["resolution"] == "MODIFY"
+    replacement_id = result["replacement_baseline_id"]
+    assert replacement_id
+    assert replacement_id != original_id
+
+    agreement = json.loads(lacuna.get_agreement(agreement_id))
+    assert agreement["status"] == "BASELINE_PROPOSED"
+    assert agreement["baseline_id"] == replacement_id
+    assert agreement["client_baseline_acceptance"] is False
+    assert agreement["contractor_baseline_acceptance"] is False
+
+    replacement = json.loads(lacuna.get_counterfactual_baseline(replacement_id))
+    assert replacement["status"] == "PROPOSED"
+    assert replacement["expected_value_bps"] == 3000
+
+    # original baseline preserved, superseded, still queryable
+    original = json.loads(lacuna.get_counterfactual_baseline(original_id))
+    assert original["status"] == "VOID"
+    assert original["expected_value_bps"] == 3400
+
+    history = json.loads(lacuna.list_baseline_evaluations(agreement_id))
+    assert {b["baseline_id"] for b in history} == {original_id, replacement_id}
+
+
+def test_evaluate_baseline_challenge_void(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, baseline_id = _proposed_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    lacuna.open_baseline_challenge("CH-1", agreement_id, "BASELINE_MISCONSTRUCTED", "No defensible method here.", [])
+
+    direct_vm.mock_llm(r".*", _fenced(VOID_CHALLENGE_VERDICT))
+    result = json.loads(lacuna.evaluate_baseline_challenge("CH-1"))
+    assert result["resolution"] == "VOID"
+
+    agreement = json.loads(lacuna.get_agreement(agreement_id))
+    assert agreement["status"] == "BASELINE_FROZEN"
+    assert agreement["baseline_id"] == ""
+
+    baseline = json.loads(lacuna.get_counterfactual_baseline(baseline_id))
+    assert baseline["status"] == "VOID"
+
+    # frozen evidence never touched, and evaluate_baseline can run again
+    evidence = json.loads(lacuna.list_baseline_evidence(agreement_id))
+    assert all(item["status"] == "FROZEN" for item in evidence)
+
+    direct_vm.clear_mocks()  # drop the stale VOID challenge-verdict mock (first match wins)
+    direct_vm.mock_web("analytics.example.com/report", {"status": 200, "body": "Churn trended down steadily."})
+    direct_vm.mock_web("forum.example.org/thread", {"status": 200, "body": "Community sentiment stable."})
+    direct_vm.mock_llm(r".*", _fenced(VALID_BASELINE_VERDICT))
+    retried = json.loads(lacuna.evaluate_baseline(agreement_id))
+    assert retried["status"] == "PROPOSED"
+
+
+def test_evaluate_baseline_challenge_rejects_malformed_json(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _proposed_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    lacuna.open_baseline_challenge("CH-1", agreement_id, "EVIDENCE_OMITTED", "Statement.", [])
+
+    direct_vm.mock_llm(r".*", "not json")
+    with pytest.raises(Exception, match="not valid JSON"):
+        lacuna.evaluate_baseline_challenge("CH-1")
+
+
+def test_evaluate_baseline_challenge_rejects_invalid_bps(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _proposed_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    lacuna.open_baseline_challenge("CH-1", agreement_id, "EVIDENCE_OMITTED", "Statement.", [])
+
+    bad = dict(UPHOLD_VERDICT, confidence_bps=20000)
+    direct_vm.mock_llm(r".*", _fenced(bad))
+    with pytest.raises(Exception, match="confidence_bps must be between 0 and 10000"):
+        lacuna.evaluate_baseline_challenge("CH-1")
+
+
+def test_evaluate_baseline_challenge_rejects_invalid_replacement_range(
+    direct_deploy, direct_vm, direct_alice, direct_bob
+):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _proposed_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    lacuna.open_baseline_challenge("CH-1", agreement_id, "COMPARABLE_PERIOD_IGNORED", "Statement.", [])
+
+    bad = dict(MODIFY_VERDICT, expected_low_bps=4000)  # low > expected
+    direct_vm.mock_llm(r".*", _fenced(bad))
+    with pytest.raises(Exception, match="expected_low_bps must be <= expected_value_bps <= expected_high_bps"):
+        lacuna.evaluate_baseline_challenge("CH-1")
+
+
+def test_evaluate_baseline_challenge_rejects_decision_replacement_mismatch(
+    direct_deploy, direct_vm, direct_alice, direct_bob
+):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _proposed_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    lacuna.open_baseline_challenge("CH-1", agreement_id, "EVIDENCE_OMITTED", "Statement.", [])
+
+    bad = dict(UPHOLD_VERDICT, replacement_required=True)
+    direct_vm.mock_llm(r".*", _fenced(bad))
+    with pytest.raises(Exception, match="replacement_required must be true if and only if decision is MODIFY"):
+        lacuna.evaluate_baseline_challenge("CH-1")
+
+
+def test_evaluate_baseline_challenge_requires_open_status(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _proposed_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    lacuna.open_baseline_challenge("CH-1", agreement_id, "EVIDENCE_OMITTED", "Statement.", [])
+    direct_vm.mock_llm(r".*", _fenced(UPHOLD_VERDICT))
+    lacuna.evaluate_baseline_challenge("CH-1")
+
+    with pytest.raises(Exception, match="already been resolved"):
+        lacuna.evaluate_baseline_challenge("CH-1")
+
+
+def test_accept_baseline_valid_dual_party(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, baseline_id = _proposed_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+
+    direct_vm.sender = direct_alice
+    result = json.loads(lacuna.accept_baseline(agreement_id))
+    assert result["status"] == "BASELINE_PROPOSED"  # not final yet -- only one party accepted
+    assert result["client_baseline_acceptance"] is True
+    assert result["contractor_baseline_acceptance"] is False
+
+    baseline = json.loads(lacuna.get_counterfactual_baseline(baseline_id))
+    assert baseline["status"] == "PROPOSED"
+
+    direct_vm.sender = direct_bob
+    result = json.loads(lacuna.accept_baseline(agreement_id))
+    assert result["status"] == "BASELINE_FINAL"
+    assert result["client_baseline_acceptance"] is True
+    assert result["contractor_baseline_acceptance"] is True
+
+    baseline = json.loads(lacuna.get_counterfactual_baseline(baseline_id))
+    assert baseline["status"] == "FINAL"
+
+
+def test_accept_baseline_blocked_by_unresolved_challenge(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _proposed_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    lacuna.open_baseline_challenge("CH-1", agreement_id, "EVIDENCE_OMITTED", "Statement.", [])
+
+    with pytest.raises(Exception, match="BASELINE_PROPOSED"):
+        lacuna.accept_baseline(agreement_id)
+
+
+def test_accept_baseline_finalized_cannot_be_overwritten(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, baseline_id = _proposed_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    lacuna.accept_baseline(agreement_id)
+    direct_vm.sender = direct_bob
+    lacuna.accept_baseline(agreement_id)
+
+    with pytest.raises(Exception, match="BASELINE_PROPOSED"):
+        lacuna.accept_baseline(agreement_id)
+
+    with pytest.raises(Exception, match="BASELINE_FROZEN"):
+        lacuna.evaluate_baseline(agreement_id)
+
+    with pytest.raises(Exception, match="BASELINE_PROPOSED"):
+        lacuna.open_baseline_challenge("CH-1", agreement_id, "EVIDENCE_OMITTED", "Too late.", [])
+
+    baseline = json.loads(lacuna.get_counterfactual_baseline(baseline_id))
+    assert baseline["status"] == "FINAL"
+    assert baseline["expected_value_bps"] == 3400
+
+
+def test_finalized_frozen_evidence_remains_immutable(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _proposed_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    lacuna.accept_baseline(agreement_id)
+    direct_vm.sender = direct_bob
+    lacuna.accept_baseline(agreement_id)
+
+    evidence = json.loads(lacuna.list_baseline_evidence(agreement_id))
+    assert len(evidence) == 2
+    assert all(item["status"] == "FROZEN" for item in evidence)
+    ev1 = json.loads(lacuna.get_baseline_evidence("EV-1"))
+    assert ev1["summary"] == "Historical churn dashboard export for the baseline window."
+
+
+def test_accept_baseline_rejects_unauthorized_party(
+    direct_deploy, direct_vm, direct_alice, direct_bob, direct_charlie
+):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _proposed_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+
+    direct_vm.sender = direct_charlie
+    with pytest.raises(Exception, match="client or contractor"):
+        lacuna.accept_baseline(agreement_id)
