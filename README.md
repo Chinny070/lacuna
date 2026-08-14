@@ -62,5 +62,17 @@ advisory only: LACUNA has no bonus pool or production token-transfer logic.
   `frontend/` connects directly to the canonical StudioNet deployment and
   treats a write as successful only after finalized successful execution.
 
+## Production release
+
+- GitHub: [Chinny070/lacuna](https://github.com/Chinny070/lacuna)
+- Frontend: [lacuna-ten.vercel.app](https://lacuna-ten.vercel.app)
+- Network: GenLayer StudioNet, chain ID `61999`, RPC
+  `https://studio.genlayer.com/api`
+- Contract: `0x0FA601A457a03967a5Ed008e2f82e7966392516A`
+
+The production site has verified read-only StudioNet access. A real
+injected StudioNet-compatible wallet is still required to manually verify
+signature, network-switch, and finalized write-transaction flows.
+
 See `docs/` for constitutions, policy, evidence, security, integration, and
 StudioNet deployment preparation.
