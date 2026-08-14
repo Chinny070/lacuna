@@ -14,6 +14,26 @@ export type TransactionPhase =
 export type TransactionState = { phase: TransactionPhase; hash?: TransactionHash; receipt?: GenLayerTransaction; error?: NormalizedError };
 export type TransactionUpdate = (state: TransactionState) => void;
 
+/**
+ * StudioNet receipts can expose execution success at the transaction level or
+ * within the consensus leader receipt. A finalized/accepted consensus status
+ * alone is never considered successful execution.
+ */
+export function hasSuccessfulExecution(receipt: GenLayerTransaction): boolean {
+  const raw = receipt as unknown as {
+    txExecutionResult?: number;
+    txExecutionResultName?: string;
+    consensus_data?: { leader_receipt?: Array<{ execution_result?: string | number; genvm_result?: string | number }> };
+  };
+  if (raw.txExecutionResult === 1 || raw.txExecutionResultName === "FINISHED_WITH_RETURN") return true;
+
+  return (raw.consensus_data?.leader_receipt ?? []).some((leaderReceipt) =>
+    leaderReceipt.execution_result === "FINISHED_WITH_RETURN"
+    || leaderReceipt.execution_result === "SUCCESS"
+    || leaderReceipt.genvm_result === "SUCCESS",
+  );
+}
+
 export async function waitForFinality(
   client: WalletClient,
   hash: TransactionHash,
@@ -26,7 +46,7 @@ export async function waitForFinality(
     update({ phase: "accepted", hash });
     update({ phase: "awaiting_finality", hash });
     const receipt = await client.waitForTransactionReceipt({ hash, status: finalizedStatus, interval: 2_000, retries: 180 });
-    if (receipt.txExecutionResultName === "FINISHED_WITH_RETURN") {
+    if (hasSuccessfulExecution(receipt)) {
       update({ phase: "finalized_success", hash, receipt });
       return receipt;
     }
