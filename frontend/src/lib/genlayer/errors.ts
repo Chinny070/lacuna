@@ -11,6 +11,10 @@ export type NormalizedErrorCode =
 
 export type NormalizedError = { code: NormalizedErrorCode; message: string; detail?: string };
 
+export function isNormalizedError(error: unknown): error is NormalizedError {
+  return typeof error === "object" && error !== null && "code" in error && "message" in error;
+}
+
 export function normalizeGenLayerError(error: unknown): NormalizedError {
   const detail = error instanceof Error ? error.message : String(error);
   const lower = detail.toLowerCase();

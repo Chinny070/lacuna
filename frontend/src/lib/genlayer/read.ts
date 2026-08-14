@@ -11,7 +11,7 @@ async function read(method: string, args: ContractValue[] = []): Promise<string>
     // records. Getter calls are ID lookups, so expose the documented user
     // outcome instead of an opaque SDK error.
     if (method.startsWith("get_")) {
-      throw new Error("The requested LACUNA record does not exist.");
+      throw { code: "record_not_found", message: "The requested LACUNA record does not exist." };
     }
     throw normalizeGenLayerError(error);
   }

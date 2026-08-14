@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { normalizeGenLayerError, type NormalizedError } from "../lib/genlayer/errors";
+import { isNormalizedError, normalizeGenLayerError, type NormalizedError } from "../lib/genlayer/errors";
 
 export function useContractData<T>(load: () => Promise<T>, dependencies: unknown[] = []) {
   const [data, setData] = useState<T>();
@@ -7,7 +7,7 @@ export function useContractData<T>(load: () => Promise<T>, dependencies: unknown
   const [loading, setLoading] = useState(true);
   const refresh = useCallback(async () => {
     setLoading(true); setError(undefined);
-    try { setData(await load()); } catch (cause) { setError(normalizeGenLayerError(cause)); } finally { setLoading(false); }
+    try { setData(await load()); } catch (cause) { setError(isNormalizedError(cause) ? cause : normalizeGenLayerError(cause)); } finally { setLoading(false); }
   // load is intentionally supplied by page closures; dependencies define refresh triggers.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, dependencies);
