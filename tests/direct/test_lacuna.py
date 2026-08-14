@@ -565,12 +565,13 @@ def _hash_of(seed: str) -> str:
     return hashlib.sha256(seed.encode()).hexdigest()
 
 
-def setup_agreement(lacuna, direct_vm, direct_alice, direct_bob, agreement_id="AGR-1"):
+def setup_agreement(lacuna, direct_vm, direct_alice, direct_bob, agreement_id="AGR-1", escrow_amount=10_000):
     """Deploys as default sender, wires client=alice, contractor=bob."""
     client = as_hex(direct_alice)
     contractor = as_hex(direct_bob)
     agreement_id, constitution_id, policy_id = create_agreement(
-        lacuna, agreement_id=agreement_id, client=client, contractor=contractor
+        lacuna, agreement_id=agreement_id, client=client, contractor=contractor,
+        escrow_amount=escrow_amount
     )
     return agreement_id, constitution_id, policy_id, client, contractor
 
@@ -994,10 +995,13 @@ INVALID_METHOD_VERDICT = {
 }
 
 
-def _ready_for_baseline_evaluation(lacuna, direct_vm, direct_alice, direct_bob, agreement_id="AGR-1"):
+def _ready_for_baseline_evaluation(lacuna, direct_vm, direct_alice, direct_bob, agreement_id="AGR-1", escrow_amount=10_000):
     """Agreement with two categories of frozen baseline evidence, evidence
     source URLs mocked. Ready for evaluate_baseline()."""
-    agreement_id, *_ = setup_agreement(lacuna, direct_vm, direct_alice, direct_bob, agreement_id=agreement_id)
+    agreement_id, *_ = setup_agreement(
+        lacuna, direct_vm, direct_alice, direct_bob,
+        agreement_id=agreement_id, escrow_amount=escrow_amount
+    )
     direct_vm.sender = direct_alice
     _submit_two_valid_categories(lacuna, agreement_id)
     lacuna.freeze_baseline_evidence(agreement_id)
@@ -1353,10 +1357,13 @@ VOID_CHALLENGE_VERDICT = {
 }
 
 
-def _proposed_agreement(lacuna, direct_vm, direct_alice, direct_bob, agreement_id="AGR-1"):
+def _proposed_agreement(lacuna, direct_vm, direct_alice, direct_bob, agreement_id="AGR-1", escrow_amount=10_000):
     """Agreement with a valid PROPOSED baseline (EV-1/EV-2 evidence, web
     mocks registered). Ready for open_baseline_challenge()/accept_baseline()."""
-    agreement_id = _ready_for_baseline_evaluation(lacuna, direct_vm, direct_alice, direct_bob, agreement_id=agreement_id)
+    agreement_id = _ready_for_baseline_evaluation(
+        lacuna, direct_vm, direct_alice, direct_bob,
+        agreement_id=agreement_id, escrow_amount=escrow_amount
+    )
     direct_vm.mock_llm(r".*", _fenced(VALID_BASELINE_VERDICT))
     result = json.loads(lacuna.evaluate_baseline(agreement_id))
     direct_vm.clear_mocks()  # drop the stage-4 verdict mock so challenge tests control their own
@@ -1692,10 +1699,13 @@ def test_accept_baseline_rejects_unauthorized_party(
 # =========================================================
 
 
-def _finalized_agreement(lacuna, direct_vm, direct_alice, direct_bob, agreement_id="AGR-1"):
+def _finalized_agreement(lacuna, direct_vm, direct_alice, direct_bob, agreement_id="AGR-1", escrow_amount=10_000):
     """Agreement with a FINAL, dual-accepted baseline. BASELINE_FINAL,
     ready for start_observation()."""
-    agreement_id, baseline_id = _proposed_agreement(lacuna, direct_vm, direct_alice, direct_bob, agreement_id=agreement_id)
+    agreement_id, baseline_id = _proposed_agreement(
+        lacuna, direct_vm, direct_alice, direct_bob,
+        agreement_id=agreement_id, escrow_amount=escrow_amount
+    )
     direct_vm.sender = direct_alice
     lacuna.accept_baseline(agreement_id)
     direct_vm.sender = direct_bob
@@ -1703,10 +1713,13 @@ def _finalized_agreement(lacuna, direct_vm, direct_alice, direct_bob, agreement_
     return agreement_id, baseline_id
 
 
-def _observing_agreement(lacuna, direct_vm, direct_alice, direct_bob, agreement_id="AGR-1"):
+def _observing_agreement(lacuna, direct_vm, direct_alice, direct_bob, agreement_id="AGR-1", escrow_amount=10_000):
     """Agreement in OBSERVING status, ready for outcome evidence /
     alternative explanation submission."""
-    agreement_id, baseline_id = _finalized_agreement(lacuna, direct_vm, direct_alice, direct_bob, agreement_id=agreement_id)
+    agreement_id, baseline_id = _finalized_agreement(
+        lacuna, direct_vm, direct_alice, direct_bob,
+        agreement_id=agreement_id, escrow_amount=escrow_amount
+    )
     direct_vm.sender = direct_alice
     lacuna.start_observation(agreement_id)
     return agreement_id, baseline_id
@@ -2215,11 +2228,14 @@ def test_frozen_resolution_records_remain_queryable_and_immutable(
 # =========================================================
 
 
-def _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob, agreement_id="AGR-1"):
+def _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob, agreement_id="AGR-1", escrow_amount=10_000):
     """Agreement with a full frozen resolution package -- baseline evidence,
     outcome evidence (primary + both guardrails), one explanation -- and
     every evidence source_url mocked. Ready for evaluate_performance()."""
-    agreement_id, baseline_id = _observing_agreement(lacuna, direct_vm, direct_alice, direct_bob, agreement_id=agreement_id)
+    agreement_id, baseline_id = _observing_agreement(
+        lacuna, direct_vm, direct_alice, direct_bob,
+        agreement_id=agreement_id, escrow_amount=escrow_amount
+    )
     direct_vm.sender = direct_alice
     _submit_full_outcome_evidence_set(lacuna, agreement_id)
     submit_explanation(lacuna, agreement_id=agreement_id, evidence_refs=["OUT-1"])
@@ -2688,3 +2704,250 @@ def test_evaluate_performance_locked_baseline_remains_immutable(direct_deploy, d
 
     baseline_after = json.loads(lacuna.get_counterfactual_baseline(baseline_id))
     assert baseline_after == baseline_before
+
+
+# =========================================================
+# Deterministic settlement, appeals, finalization (Stage 8)
+# =========================================================
+
+
+def _proposed_verdict(
+    lacuna, direct_vm, direct_alice, direct_bob,
+    verdict=None, agreement_id="AGR-1", escrow_amount=10_000,
+):
+    agreement_id, baseline_id = _resolved_agreement(
+        lacuna, direct_vm, direct_alice, direct_bob,
+        agreement_id=agreement_id, escrow_amount=escrow_amount,
+    )
+    direct_vm.mock_llm(r".*", _fenced(verdict or PERFORMANCE_VERDICT_BASE))
+    record = json.loads(lacuna.evaluate_performance(agreement_id))
+    return agreement_id, baseline_id, record
+
+
+def _appeal_result(decision="UPHOLD", verdict=None):
+    result = dict(verdict or PERFORMANCE_VERDICT_BASE)
+    result["decision"] = decision
+    result["replacement_required"] = decision == "MODIFY"
+    return result
+
+
+@pytest.mark.parametrize(
+    "performance,expected_base,status",
+    [
+        (0, 0, "BELOW_MINIMUM"),
+        (1999, 0, "BELOW_MINIMUM"),
+        (2000, 0, "PARTIAL_BASE_PAYMENT"),
+        (4000, 5000, "PARTIAL_BASE_PAYMENT"),
+        (6000, 10000, "FULL_BASE_PAYMENT"),
+        (10000, 10000, "FULL_BASE_PAYMENT"),
+    ],
+)
+def test_settlement_thresholds_and_boundaries(
+    direct_deploy, direct_vm, direct_alice, direct_bob,
+    performance, expected_base, status,
+):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    verdict = dict(
+        PERFORMANCE_VERDICT_BASE,
+        attribution_bps=performance,
+        performance_bps=performance,
+        alternative_explanation_strength_bps=0,
+        reason_codes=["OUTCOME_NOT_OUTSIDE_EXPECTED_RANGE"] if performance == 0 else ["OUTCOME_EXCEEDS_EXPECTED_RANGE"],
+    )
+    agreement_id, _, _ = _proposed_verdict(lacuna, direct_vm, direct_alice, direct_bob, verdict)
+    preview = json.loads(lacuna.get_settlement_preview(agreement_id))
+    assert preview["base_payment"] == expected_base
+    assert preview["final_payment"] == expected_base
+    assert preview["unpaid_amount"] == 10_000 - expected_base
+    assert preview["settlement_status"] == status
+    assert 0 <= preview["base_payment"] <= preview["escrow_amount"]
+
+
+def test_settlement_bonus_entitlement_and_cap(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    verdict = dict(PERFORMANCE_VERDICT_BASE, attribution_bps=10000, performance_bps=10000)
+    agreement_id, _, _ = _proposed_verdict(lacuna, direct_vm, direct_alice, direct_bob, verdict)
+    preview = json.loads(lacuna.get_settlement_preview(agreement_id))
+    assert preview["bonus_payment"] == 1500
+    assert preview["bonus_advisory_only"] is True
+    assert preview["final_payment"] == 10_000
+
+
+def test_settlement_unresolved_confounder_cap(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    verdict = dict(PERFORMANCE_VERDICT_BASE, attribution_bps=9000, performance_bps=9000, alternative_explanation_strength_bps=5000)
+    agreement_id, _, _ = _proposed_verdict(lacuna, direct_vm, direct_alice, direct_bob, verdict)
+    preview = json.loads(lacuna.get_settlement_preview(agreement_id))
+    assert preview["confounder_cap_applied"] is True
+    assert preview["effective_performance_bps"] == 3000
+    assert preview["base_payment"] == 2500
+
+
+def test_settlement_guardrail_cap(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    verdict = dict(GUARDRAIL_VIOLATION_VERDICT, attribution_bps=9000, performance_bps=8000)
+    agreement_id, _, _ = _proposed_verdict(lacuna, direct_vm, direct_alice, direct_bob, verdict)
+    preview = json.loads(lacuna.get_settlement_preview(agreement_id))
+    assert preview["guardrail_cap_applied"] is True
+    assert preview["effective_performance_bps"] == 4000
+    assert preview["base_payment"] == 5000
+
+
+def test_settlement_both_caps_together(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    verdict = dict(GUARDRAIL_VIOLATION_VERDICT, attribution_bps=9000, performance_bps=8000, alternative_explanation_strength_bps=5000)
+    agreement_id, _, _ = _proposed_verdict(lacuna, direct_vm, direct_alice, direct_bob, verdict)
+    preview = json.loads(lacuna.get_settlement_preview(agreement_id))
+    assert preview["confounder_cap_applied"] is True
+    assert preview["guardrail_cap_applied"] is True
+    assert preview["effective_performance_bps"] == 3000
+    assert preview["base_payment"] == 2500
+
+
+def test_settlement_zero_escrow_and_repeatability(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _, _ = _proposed_verdict(
+        lacuna, direct_vm, direct_alice, direct_bob, escrow_amount=0,
+    )
+    first = json.loads(lacuna.get_settlement_preview(agreement_id))
+    second = json.loads(lacuna.get_settlement_preview(agreement_id))
+    assert first == second
+    assert first["escrow_amount"] == first["base_payment"] == first["final_payment"] == 0
+    assert first["bonus_payment"] == first["unpaid_amount"] == 0
+
+
+def test_settlement_monotonic_for_identical_caps(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _, verdict = _proposed_verdict(lacuna, direct_vm, direct_alice, direct_bob)
+    payments = []
+    for performance in (2000, 3000, 4000, 5000, 6000, 9000):
+        # Direct-storage mutation is intentionally test-only: it isolates the
+        # pure view's arithmetic while holding every confounder/guardrail and
+        # policy input identical. No production write method permits this.
+        stored = json.loads(lacuna.verdicts[verdict["verdict_id"]])
+        stored["performance_bps"] = performance
+        stored["attribution_bps"] = performance
+        stored["alternative_explanation_strength_bps"] = 0
+        stored["guardrail_penalty_bps"] = 0
+        lacuna.verdicts[verdict["verdict_id"]] = json.dumps(stored)
+        payments.append(json.loads(lacuna.get_settlement_preview(agreement_id))["base_payment"])
+    assert payments == sorted(payments)
+
+
+def test_open_appeal_valid_and_listed(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _, verdict = _proposed_verdict(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_bob
+    assert lacuna.open_appeal("APP-1", agreement_id, "ATTRIBUTION_OVERSTATED", "Attribution ignores a confounder.", ["OUT-1"]) == "APP-1"
+    appeal = json.loads(lacuna.get_appeal("APP-1"))
+    assert appeal["verdict_id"] == verdict["verdict_id"]
+    assert appeal["status"] == "OPEN"
+    assert len(json.loads(lacuna.list_appeals(agreement_id))) == 1
+    assert json.loads(lacuna.get_agreement(agreement_id))["status"] == "APPEALED"
+
+
+@pytest.mark.parametrize("mode", ["unauthorized", "ground", "ref"])
+def test_open_appeal_rejects_unauthorized_invalid_ground_and_ref(
+    direct_deploy, direct_vm, direct_alice, direct_bob, direct_charlie, mode,
+):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _, _ = _proposed_verdict(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_charlie if mode == "unauthorized" else direct_alice
+    with pytest.raises(Exception, match="client or contractor" if mode == "unauthorized" else "ground must" if mode == "ground" else "outside the frozen"):
+        lacuna.open_appeal("APP-1", agreement_id, "NOT_REAL" if mode == "ground" else "EVIDENCE_OMITTED", "Statement", ["NOPE"] if mode == "ref" else ["OUT-1"])
+
+
+def test_open_appeal_rejects_duplicate_unresolved(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _, _ = _proposed_verdict(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    lacuna.open_appeal("APP-1", agreement_id, "EVIDENCE_OMITTED", "One", ["OUT-1"])
+    with pytest.raises(Exception, match="VERDICT_PROPOSED"):
+        lacuna.open_appeal("APP-2", agreement_id, "EVIDENCE_OMITTED", "Two", ["OUT-1"])
+
+
+@pytest.mark.parametrize("decision", ["UPHOLD", "MODIFY", "VOID"])
+def test_evaluate_appeal_decisions(direct_deploy, direct_vm, direct_alice, direct_bob, decision):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, baseline_id, original = _proposed_verdict(lacuna, direct_vm, direct_alice, direct_bob)
+    baseline_before = json.loads(lacuna.get_counterfactual_baseline(baseline_id))
+    evidence_before = json.loads(lacuna.list_outcome_evidence(agreement_id))
+    direct_vm.sender = direct_bob
+    lacuna.open_appeal("APP-1", agreement_id, "ATTRIBUTION_OVERSTATED", "Review attribution.", ["OUT-1"])
+    direct_vm.clear_mocks()
+    modified = dict(PERFORMANCE_VERDICT_BASE, attribution_bps=6000, performance_bps=5500, summary="Corrected attribution after appeal review.")
+    direct_vm.mock_llm(r".*", _fenced(_appeal_result(decision, modified if decision == "MODIFY" else None)))
+    appeal = json.loads(lacuna.evaluate_appeal("APP-1"))
+    agreement = json.loads(lacuna.get_agreement(agreement_id))
+    assert appeal["decision"] == decision
+    assert json.loads(lacuna.get_counterfactual_baseline(baseline_id)) == baseline_before
+    assert json.loads(lacuna.list_outcome_evidence(agreement_id)) == evidence_before
+    original_after = json.loads(lacuna.get_verdict(original["verdict_id"]))
+    if decision == "UPHOLD":
+        assert agreement["status"] == "VERDICT_PROPOSED"
+        assert agreement["verdict_id"] == original["verdict_id"]
+        assert original_after["status"] == "PROPOSED"
+    elif decision == "MODIFY":
+        assert agreement["status"] == "VERDICT_PROPOSED"
+        assert appeal["replacement_verdict_id"] != original["verdict_id"]
+        assert original_after["status"] == "VOID"
+        replacement = json.loads(lacuna.get_verdict(appeal["replacement_verdict_id"]))
+        assert replacement["performance_bps"] == 5500
+        assert len(json.loads(lacuna.list_verdicts(agreement_id))) == 2
+    else:
+        assert agreement["status"] == "RESOLUTION_FROZEN"
+        assert agreement["verdict_id"] == ""
+        assert original_after["status"] == "VOID"
+
+
+def test_evaluate_appeal_rejects_malformed_output(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _, _ = _proposed_verdict(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    lacuna.open_appeal("APP-1", agreement_id, "EVIDENCE_OMITTED", "Review.", ["OUT-1"])
+    direct_vm.clear_mocks()
+    direct_vm.mock_llm(r".*", "not json")
+    with pytest.raises(Exception, match="Malformed appeal output"):
+        lacuna.evaluate_appeal("APP-1")
+
+
+def test_finalize_verdict_and_final_state_invariants(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, baseline_id, proposed = _proposed_verdict(lacuna, direct_vm, direct_alice, direct_bob)
+    baseline_before = json.loads(lacuna.get_counterfactual_baseline(baseline_id))
+    evidence_before = json.loads(lacuna.list_outcome_evidence(agreement_id))
+    direct_vm.sender = direct_alice
+    final = json.loads(lacuna.finalize_verdict(agreement_id))
+    assert final["status"] == "FINAL"
+    assert json.loads(lacuna.get_agreement(agreement_id))["status"] == "FINALIZED"
+    assert json.loads(lacuna.get_counterfactual_baseline(baseline_id)) == baseline_before
+    assert json.loads(lacuna.list_outcome_evidence(agreement_id)) == evidence_before
+    assert json.loads(lacuna.get_settlement_preview(agreement_id))["performance_bps"] == proposed["performance_bps"]
+    with pytest.raises(Exception, match="RESOLUTION_FROZEN"):
+        lacuna.evaluate_performance(agreement_id)
+    with pytest.raises(Exception, match="VERDICT_PROPOSED"):
+        lacuna.finalize_verdict(agreement_id)
+
+
+def test_finalize_blocked_by_unresolved_appeal_and_void_verdict(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _, _ = _proposed_verdict(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    lacuna.open_appeal("APP-1", agreement_id, "EVIDENCE_OMITTED", "Review.", ["OUT-1"])
+    with pytest.raises(Exception, match="VERDICT_PROPOSED"):
+        lacuna.finalize_verdict(agreement_id)
+    direct_vm.clear_mocks()
+    direct_vm.mock_llm(r".*", _fenced(_appeal_result("VOID")))
+    lacuna.evaluate_appeal("APP-1")
+    with pytest.raises(Exception, match="VERDICT_PROPOSED"):
+        lacuna.finalize_verdict(agreement_id)
+
+
+def test_finalize_verdict_rejects_unauthorized_party(
+    direct_deploy, direct_vm, direct_alice, direct_bob, direct_charlie,
+):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _, _ = _proposed_verdict(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_charlie
+    with pytest.raises(Exception, match="client or contractor"):
+        lacuna.finalize_verdict(agreement_id)
