@@ -211,6 +211,21 @@ _BASELINE_BPS_FIELDS = (
 )
 
 
+def _validate_exact_schema(data: dict, required_fields: tuple, label: str) -> None:
+    """Reject unknown top-level consensus-output fields.
+
+    Each adjudication result is an on-chain protocol input, not an extensible
+    application payload. Failing closed avoids silently accepting a response
+    shape that a future prompt, model, or caller interprets differently.
+    """
+    unknown_fields = set(data) - set(required_fields)
+    if unknown_fields:
+        raise gl.vm.UserError(
+            f"Malformed {label} output: unsupported field(s): "
+            + ", ".join(sorted(unknown_fields))
+        )
+
+
 def _validate_baseline_verdict(raw_result: str, valid_evidence_refs: set) -> dict:
     """Deterministic, defensive parsing of the leader/validator-agreed
     counterfactual-baseline JSON. Runs entirely on the already-finalized
@@ -229,6 +244,7 @@ def _validate_baseline_verdict(raw_result: str, valid_evidence_refs: set) -> dic
     for field in _BASELINE_REQUIRED_FIELDS:
         if field not in data:
             raise gl.vm.UserError(f"Malformed baseline output: missing field '{field}'")
+    _validate_exact_schema(data, _BASELINE_REQUIRED_FIELDS, "baseline")
 
     for field in _BASELINE_BPS_FIELDS:
         value = data[field]
@@ -320,6 +336,7 @@ def _validate_challenge_verdict(raw_result: str, valid_evidence_refs: set) -> di
     for field in _CHALLENGE_REQUIRED_FIELDS:
         if field not in data:
             raise gl.vm.UserError(f"Malformed challenge output: missing field '{field}'")
+    _validate_exact_schema(data, _CHALLENGE_REQUIRED_FIELDS, "challenge")
 
     decision = data["decision"]
     if not isinstance(decision, str) or decision not in CHALLENGE_DECISIONS:
@@ -494,6 +511,7 @@ def _validate_performance_verdict(
     for field in _PERFORMANCE_REQUIRED_FIELDS:
         if field not in data:
             raise gl.vm.UserError(f"Malformed performance output: missing field '{field}'")
+    _validate_exact_schema(data, _PERFORMANCE_REQUIRED_FIELDS, "performance")
 
     for field in _PERFORMANCE_BPS_FIELDS:
         value = data[field]
@@ -600,6 +618,11 @@ def _validate_appeal_verdict(
         raise gl.vm.UserError("Malformed appeal output: missing field 'decision'")
     if "replacement_required" not in data:
         raise gl.vm.UserError("Malformed appeal output: missing field 'replacement_required'")
+    _validate_exact_schema(
+        data,
+        ("decision", "replacement_required") + _PERFORMANCE_REQUIRED_FIELDS,
+        "appeal",
+    )
     decision = data["decision"]
     if not isinstance(decision, str) or decision not in APPEAL_DECISIONS:
         raise gl.vm.UserError("decision must be one of: MODIFY, UPHOLD, VOID")
@@ -609,7 +632,7 @@ def _validate_appeal_verdict(
     if replacement_required != (decision == "MODIFY"):
         raise gl.vm.UserError("replacement_required must be true exactly when decision is MODIFY")
 
-    performance_data = {field: data[field] for field in _PERFORMANCE_REQUIRED_FIELDS if field in data}
+    performance_data = {field: data[field] for field in _PERFORMANCE_REQUIRED_FIELDS}
     validated = _validate_performance_verdict(
         json.dumps(performance_data), valid_evidence_refs, locked_baseline, primary_metric_bounds
     )
@@ -672,7 +695,11 @@ def _validate_source_url(source_url: str) -> str:
         raise gl.vm.UserError("source_url must use http or https")
     if not parsed.netloc:
         raise gl.vm.UserError("source_url is missing a host")
-    return parsed.netloc.lower()
+    # Port is transport metadata, not a source identity. Keeping it in the
+    # independence key would let one hostname on :443 and :8443 masquerade as
+    # two independent sources. Hostname-only tracking is deterministic while
+    # intentionally avoiding unsafe registrable-domain heuristics.
+    return parsed.hostname.lower()
 
 
 def _validate_content_hash(content_hash: str) -> None:

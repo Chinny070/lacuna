@@ -1070,19 +1070,14 @@ def test_evaluate_baseline_rejects_missing_field(direct_deploy, direct_vm, direc
         lacuna.evaluate_baseline(agreement_id)
 
 
-def test_evaluate_baseline_tolerates_extra_unknown_fields(direct_deploy, direct_vm, direct_alice, direct_bob):
-    """Design choice (documented in the Stage 4 report): unknown top-level
-    keys are ignored rather than rejected -- only the required fields are
-    validated for presence/type/range, since an unused extra key cannot
-    affect what gets stored."""
+def test_evaluate_baseline_rejects_extra_unknown_fields(direct_deploy, direct_vm, direct_alice, direct_bob):
     lacuna = direct_deploy("contracts/lacuna.py")
     agreement_id = _ready_for_baseline_evaluation(lacuna, direct_vm, direct_alice, direct_bob)
     extra = dict(VALID_BASELINE_VERDICT, unexpected_field="ignored", another_bonus_key=123)
     direct_vm.mock_llm(r".*", _fenced(extra))
 
-    result = json.loads(lacuna.evaluate_baseline(agreement_id))
-    assert result["expected_value_bps"] == 3400
-    assert "unexpected_field" not in result
+    with pytest.raises(Exception, match="unsupported field"):
+        lacuna.evaluate_baseline(agreement_id)
 
 
 def test_evaluate_baseline_rejects_wrong_field_type(direct_deploy, direct_vm, direct_alice, direct_bob):
@@ -2951,3 +2946,65 @@ def test_finalize_verdict_rejects_unauthorized_party(
     direct_vm.sender = direct_charlie
     with pytest.raises(Exception, match="client or contractor"):
         lacuna.finalize_verdict(agreement_id)
+
+
+def test_baseline_challenge_rejects_extra_unknown_fields(
+    direct_deploy, direct_vm, direct_alice, direct_bob,
+):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _proposed_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    lacuna.open_baseline_challenge("CH-strict", agreement_id, "EVIDENCE_OMITTED", "Review.", ["EV-1"])
+    direct_vm.mock_llm(r".*", _fenced(dict(UPHOLD_VERDICT, unexpected_field=True)))
+    with pytest.raises(Exception, match="unsupported field"):
+        lacuna.evaluate_baseline_challenge("CH-strict")
+
+
+def test_performance_rejects_extra_unknown_fields(
+    direct_deploy, direct_vm, direct_alice, direct_bob,
+):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _ = _resolved_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.mock_llm(r".*", _fenced(dict(PERFORMANCE_VERDICT_BASE, unexpected_field=True)))
+    with pytest.raises(Exception, match="unsupported field"):
+        lacuna.evaluate_performance(agreement_id)
+
+
+def test_performance_appeal_rejects_extra_unknown_fields(
+    direct_deploy, direct_vm, direct_alice, direct_bob,
+):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _, _ = _proposed_verdict(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    lacuna.open_appeal("APP-strict", agreement_id, "EVIDENCE_OMITTED", "Review.", ["OUT-1"])
+    direct_vm.clear_mocks()
+    strict_bad = dict(_appeal_result("UPHOLD"), unexpected_field=True)
+    direct_vm.mock_llm(r".*", _fenced(strict_bad))
+    with pytest.raises(Exception, match="unsupported field"):
+        lacuna.evaluate_appeal("APP-strict")
+
+
+def test_source_independence_ignores_port_variation(
+    direct_deploy, direct_vm, direct_alice, direct_bob,
+):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, *_ = setup_agreement(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    submit_evidence(
+        lacuna,
+        agreement_id=agreement_id,
+        evidence_id="EV-port-1",
+        source_type="PUBLIC_ANALYTICS",
+        source_url="https://same.example.com:443/analytics",
+    )
+    submit_evidence(
+        lacuna,
+        agreement_id=agreement_id,
+        evidence_id="EV-port-2",
+        source_type="COMMUNITY_ACTIVITY",
+        source_url="https://same.example.com:8443/community",
+    )
+    evidence = json.loads(lacuna.list_baseline_evidence(agreement_id))
+    assert {record["source_host"] for record in evidence} == {"same.example.com"}
+    with pytest.raises(Exception, match="Insufficient independent sources"):
+        lacuna.freeze_baseline_evidence(agreement_id)
