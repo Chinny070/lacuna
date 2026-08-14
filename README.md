@@ -54,8 +54,12 @@ advisory only: LACUNA has no bonus pool or production token-transfer logic.
 - `source_host` stores the raw normalized hostname. Different subdomains may
   share an owner; LACUNA does not claim this proves independence because safe
   registrable-domain normalization needs public-suffix data.
-- No deployment address, production transfer path, or frontend integration is
-  included at this stage.
+- Canonical StudioNet deployment:
+  `0x0FA601A457a03967a5Ed008e2f82e7966392516A`. The deployed source matches
+  the audited Stage 9 source after newline normalization; its schema snapshot
+  is recorded in `docs/deployed-schema.json`.
+- No production transfer path or frontend integration is included at this
+  stage.
 
 See `docs/` for constitutions, policy, evidence, security, integration, and
 StudioNet deployment preparation.
