@@ -58,8 +58,9 @@ advisory only: LACUNA has no bonus pool or production token-transfer logic.
   `0x0FA601A457a03967a5Ed008e2f82e7966392516A`. The deployed source matches
   the audited Stage 9 source after newline normalization; its schema snapshot
   is recorded in `docs/deployed-schema.json`.
-- No production transfer path or frontend integration is included at this
-  stage.
+- No production transfer path exists. The React/TypeScript frontend in
+  `frontend/` connects directly to the canonical StudioNet deployment and
+  treats a write as successful only after finalized successful execution.
 
 See `docs/` for constitutions, policy, evidence, security, integration, and
 StudioNet deployment preparation.

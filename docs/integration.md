@@ -14,5 +14,8 @@ Safe write sequence:
 
 Only client and contractor addresses may submit evidence, request evaluation,
 challenge/appeal, accept a baseline, or finalize. Views return JSON strings.
-Wait for write confirmation before reading derived state. There is no backend,
-contract address, transfer endpoint, or frontend adapter in this stage.
+Wait for finalized successful execution before reading derived state. The
+Stage 12 React/TypeScript frontend in `frontend/` provides schema-backed
+StudioNet adapters for all 40 methods at
+`0x0FA601A457a03967a5Ed008e2f82e7966392516A`; it has no backend or transfer
+endpoint.
