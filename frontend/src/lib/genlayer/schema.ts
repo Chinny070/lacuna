@@ -1,4 +1,6 @@
-import deployedSchema from "../../../../docs/deployed-schema.json";
+// Deployment-safe copy of the audited docs/deployed-schema.json snapshot.
+// Keep this file byte-for-byte schema-equivalent when the deployed contract changes.
+import deployedSchema from "./deployed-schema.json";
 
 export type ContractValue = string | number | string[];
 export type ContractMethod = (typeof deployedSchema.methods)[number];
