@@ -1,6 +1,6 @@
 [project]
 name = "lacuna"
-version = "0.1.0"
+version = "0.2.0"
 description = "LACUNA — a reusable counterfactual performance-settlement primitive for GenLayer"
 requires-python = ">=3.12"
 

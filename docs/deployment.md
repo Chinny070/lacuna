@@ -3,8 +3,12 @@
 LACUNA is deployed on GenLayer StudioNet at
 `0x0FA601A457a03967a5Ed008e2f82e7966392516A`.
 
-Do not redeploy this contract from this repository. This document records the
-manual Studio deployment and safe post-deployment procedure.
+That instance runs the Stage 9 source. The v0.2.0 protocol hardening in this
+repository (party-gated freezes, bound evidence snapshots, exact-match
+adjudication consensus, dual-acknowledged finalization) is not live there, and
+running it requires a fresh manual Studio deployment -- the recorded address is
+never upgraded in place. This document records the manual Studio deployment and
+safe post-deployment procedure.
 
 ## Production status
 

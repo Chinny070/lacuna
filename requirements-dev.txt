@@ -1,0 +1,4 @@
+# Direct-contract regression dependencies. Install from a clean Python 3.12+
+# environment with: python -m pip install -r requirements-dev.txt
+genlayer-test==0.29.2
+pytest==9.1.1

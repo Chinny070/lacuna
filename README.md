@@ -26,7 +26,10 @@ authorization, storage, validation, state transitions, and settlement math.
 
 Client and contractor both accept the baseline before `BASELINE_FINAL`. Its
 methodology, expected range, frozen baseline evidence, constitution reference,
-and settlement-policy reference are then locked for the agreement.
+and settlement-policy reference are then locked for the agreement. Only an
+agreement party may freeze either evidence package. Freeze captures a bounded,
+consensus-agreed evidence snapshot and stores its SHA-256 digest; later
+adjudication uses that immutable snapshot, not silently changed live pages.
 
 ## Attribution and settlement
 
@@ -49,15 +52,33 @@ advisory only: LACUNA has no bonus pool or production token-transfer logic.
 
 - Contract: `contracts/lacuna.py`; no backend or admin override.
 - Tests: `tests/direct`; all web/LLM calls are mocked in regression tests.
-- Only frozen stored evidence URLs are fetched. Content is bounded, delimited,
-  and explicitly treated as untrusted evidence, not instructions.
+- Evidence URLs are fetched only during party-authorized freeze, inside a
+  GenLayer strict-equality block. The bounded captured content and digest become
+  the immutable adjudication package; content is explicitly treated as
+  untrusted evidence, not instructions.
+- Freezing binds evidence to one consensus-agreed rendering, so a source that
+  renders differently for each validator (per-request timestamps, nonces,
+  personalization) cannot be frozen: the freeze reverts and the package stays
+  open. Each frozen item also stores up to 4,000 characters on-chain.
+- Adjudication consensus requires exact agreement on every decision-bearing
+  number. Because base payment scales linearly between the minimum and full
+  thresholds, any tolerated numeric spread would change the settlement result,
+  so disagreement fails consensus instead of silently moving the payout.
+- A verdict finalizes only on both parties' acknowledgement. The contract reads
+  no trusted clock, so it cannot expire an appeal window; a party that never
+  acknowledges leaves the agreement in `VERDICT_PROPOSED`. Nothing is
+  transferred or lost -- settlement is advisory -- but the record stays open.
 - `source_host` stores the raw normalized hostname. Different subdomains may
   share an owner; LACUNA does not claim this proves independence because safe
   registrable-domain normalization needs public-suffix data.
 - Canonical StudioNet deployment:
-  `0x0FA601A457a03967a5Ed008e2f82e7966392516A`. The deployed source matches
-  the audited Stage 9 source after newline normalization; its schema snapshot
-  is recorded in `docs/deployed-schema.json`.
+  `0x0FA601A457a03967a5Ed008e2f82e7966392516A`. That instance runs the audited
+  Stage 9 source (matching after newline normalization) and predates the v0.2.0
+  protocol hardening in this repository -- party-gated freezes, bound evidence
+  snapshots, exact-match adjudication consensus, and dual-acknowledged
+  finalization are not live at that address. The method signatures are
+  unchanged, so the schema snapshot in `docs/deployed-schema.json` still
+  describes the ABI; redeploy to run the hardened protocol.
 - No production transfer path exists. The React/TypeScript frontend in
   `frontend/` connects directly to the canonical StudioNet deployment and
   treats a write as successful only after finalized successful execution.
@@ -76,3 +97,16 @@ signature, network-switch, and finalized write-transaction flows.
 
 See `docs/` for constitutions, policy, evidence, security, integration, and
 StudioNet deployment preparation.
+
+## Reproducible direct tests
+
+From a clean Python 3.12+ environment:
+
+```bash
+python -m pip install -r requirements-dev.txt
+pytest tests/direct/ -v
+```
+
+`tests/direct/conftest.py` contains a Windows-only compatibility shim for the
+known `genlayer-test==0.29.2` stdin temp-file unlink issue. It affects the test
+harness only; it does not patch site-packages or weaken contract assertions.
