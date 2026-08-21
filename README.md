@@ -101,8 +101,8 @@ The production site has verified read-only StudioNet access. A real
 injected StudioNet-compatible wallet is still required to manually verify
 signature, network-switch, and finalized write-transaction flows.
 
-See `docs/` for constitutions, policy, evidence, security, integration, and
-StudioNet deployment preparation.
+See `docs/` for constitutions, policy, evidence, security, integration,
+StudioNet deployment, and the live smoke test.
 
 ## Reproducible direct tests
 

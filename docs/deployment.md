@@ -118,6 +118,13 @@ describe another:
 Redeploy the Vercel frontend after changing its environment variables;
 build-time `VITE_` values do not update on their own.
 
+## Smoke test
+
+`docs/smoke-test.md` is the post-deployment smoke test: a read pass covering
+all 23 view methods (already run against this deployment) and a wallet-driven
+write pass that exercises party-gated freezes, snapshot capture under real
+consensus, exact-match adjudication, and dual-acknowledged finalization.
+
 ## First safe write flow
 
 Create a constitution, policy, and agreement with valid non-zero addresses and
