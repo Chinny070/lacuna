@@ -1,6 +1,6 @@
 # LACUNA frontend
 
-The Stage 12 product interface is a counterfactual evidence laboratory, not a generic contract explorer. It reads the canonical StudioNet deployment at `0x0FA601A457a03967a5Ed008e2f82e7966392516A` using the exact schema snapshot in `../docs/deployed-schema.json`.
+The Stage 12 product interface is a counterfactual evidence laboratory, not a generic contract explorer. It reads the canonical StudioNet deployment at `0x5abdf6380Faaa1f0Eb51cc666A8660D5a8Dd73a6` using the exact schema snapshot in `../docs/deployed-schema.json`.
 
 ## Visual system
 

@@ -7,7 +7,7 @@ export const GENLAYER_RPC_URL = required("VITE_GENLAYER_RPC_URL", "https://studi
 export const STUDIO_NET_CHAIN_ID = Number(required("VITE_GENLAYER_CHAIN_ID", "61999"));
 export const LACUNA_CONTRACT_ADDRESS = required(
   "VITE_LACUNA_CONTRACT_ADDRESS",
-  "0x0FA601A457a03967a5Ed008e2f82e7966392516A",
+  "0x5abdf6380Faaa1f0Eb51cc666A8660D5a8Dd73a6",
 ) as `0x${string}`;
 
 if (!Number.isInteger(STUDIO_NET_CHAIN_ID) || STUDIO_NET_CHAIN_ID !== studionet.id) {

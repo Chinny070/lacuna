@@ -1,7 +1,7 @@
 {
   "retrieved_from": "GenLayer StudioNet via genlayer-js@1.1.8 getContractSchema",
-  "retrieved_at": "2026-08-14",
-  "address": "0x0FA601A457a03967a5Ed008e2f82e7966392516A",
+  "retrieved_at": "2026-08-21",
+  "address": "0x5abdf6380Faaa1f0Eb51cc666A8660D5a8Dd73a6",
   "chain": { "id": 61999, "name": "Genlayer Studio Network", "rpc": "https://studio.genlayer.com/api" },
   "constructor": { "params": [] },
   "method_count": 40,
@@ -49,5 +49,5 @@
     { "name": "submit_baseline_evidence", "params": [["evidence_id", "string"], ["agreement_id", "string"], ["source_type", "string"], ["source_url", "string"], ["content_hash", "string"], ["summary", "string"], ["metric_ref", "string"], ["period_start", "int"], ["period_end", "int"]], "readonly": false, "returns": "string" },
     { "name": "submit_outcome_evidence", "params": [["evidence_id", "string"], ["agreement_id", "string"], ["source_type", "string"], ["source_url", "string"], ["content_hash", "string"], ["summary", "string"], ["metric_ref", "string"], ["observed_value_bps", "int"], ["period_start", "int"], ["period_end", "int"]], "readonly": false, "returns": "string" }
   ],
-  "deployed_source_normalized_sha256": "d802562731d2744978008585f0a17ef8054b156c55a096c968b297b27a5b0ae2"
+  "deployed_source_normalized_sha256": "d6aa8bd41ae57784c391e51c720a2516f5bcd246b37d93771e0a10f1c4640656"
 }
