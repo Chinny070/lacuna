@@ -81,13 +81,16 @@ advisory only: LACUNA has no bonus pool or production token-transfer logic.
   share an owner; LACUNA does not claim this proves independence because safe
   registrable-domain normalization needs public-suffix data.
 - Canonical StudioNet deployment:
-  `0x5abdf6380Faaa1f0Eb51cc666A8660D5a8Dd73a6`, running the v0.2.0
-  protocol-hardening source (normalized sha256
-  `d6aa8bd41ae57784c391e51c720a2516f5bcd246b37d93771e0a10f1c4640656`). Its
+  `0x964a6e11922F9745d46c906c357dfEDAacC64F91`, running the v0.2.1 source
+  (normalized sha256
+  `1331446574fae97336f8867ba3ee172566e431ea1ac85d0ef8b714b7787bb2f7`). Its
   schema was retrieved from the live contract through official GenLayerJS and
-  is recorded in `docs/deployed-schema.json`. The Stage 9 instance at
-  `0x0FA601A457a03967a5Ed008e2f82e7966392516A` is superseded and is not
-  maintained; GenLayer contracts are not upgraded in place.
+  is recorded in `docs/deployed-schema.json`. Two earlier instances are
+  superseded and unmaintained, since GenLayer contracts are not upgraded in
+  place: `0x5abdf6380Faaa1f0Eb51cc666A8660D5a8Dd73a6` (v0.2.0, whose
+  exact-match consensus could not converge on-chain) and
+  `0x0FA601A457a03967a5Ed008e2f82e7966392516A` (Stage 9, before the
+  hardening).
 - No production transfer path exists. The React/TypeScript frontend in
   `frontend/` connects directly to the canonical StudioNet deployment and
   treats a write as successful only after finalized successful execution.
@@ -98,7 +101,7 @@ advisory only: LACUNA has no bonus pool or production token-transfer logic.
 - Frontend: [lacuna-ten.vercel.app](https://lacuna-ten.vercel.app)
 - Network: GenLayer StudioNet, chain ID `61999`, RPC
   `https://studio.genlayer.com/api`
-- Contract: `0x5abdf6380Faaa1f0Eb51cc666A8660D5a8Dd73a6`
+- Contract: `0x964a6e11922F9745d46c906c357dfEDAacC64F91`
 
 The production site has verified read-only StudioNet access. A real
 injected StudioNet-compatible wallet is still required to manually verify

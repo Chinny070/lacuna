@@ -24,5 +24,5 @@ the window. Views return JSON strings.
 Wait for finalized successful execution before reading derived state. The
 Stage 12 React/TypeScript frontend in `frontend/` provides schema-backed
 StudioNet adapters for all 40 methods at
-`0x5abdf6380Faaa1f0Eb51cc666A8660D5a8Dd73a6`; it has no backend or transfer
+`0x964a6e11922F9745d46c906c357dfEDAacC64F91`; it has no backend or transfer
 endpoint.

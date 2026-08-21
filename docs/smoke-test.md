@@ -1,7 +1,7 @@
 # Live smoke test
 
 Exercises the deployed contract at
-`0x5abdf6380Faaa1f0Eb51cc666A8660D5a8Dd73a6` on StudioNet. The direct test
+`0x964a6e11922F9745d46c906c357dfEDAacC64F91` on StudioNet. The direct test
 suite already covers contract logic with mocks; this document covers only what
 mocks cannot: real validator consensus, real web fetches, and real wallets.
 
@@ -13,7 +13,9 @@ Run against the deployed address:
 npm --prefix frontend run verify:live
 ```
 
-All 23 view methods were exercised on 2026-08-21. Result: `list_agreements`,
+All 23 view methods were exercised on 2026-08-21 against the run-1 contract
+`0x5abdf6380Faaa1f0Eb51cc666A8660D5a8Dd73a6`, and the empty-state reads were
+repeated against the current address before run 2. Result: `list_agreements`,
 `list_constitutions`, `list_settlement_policies`, `get_constitution_versions`,
 and `get_settlement_policy_versions` returned `[]`; every agreement-scoped
 getter and list reverted for an unknown ID, as expected on an empty contract.

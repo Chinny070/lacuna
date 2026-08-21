@@ -1,6 +1,6 @@
 {
   "source": "../../../../docs/deployed-schema.json",
-  "address": "0x5abdf6380Faaa1f0Eb51cc666A8660D5a8Dd73a6",
+  "address": "0x964a6e11922F9745d46c906c357dfEDAacC64F91",
   "chain": { "id": 61999, "rpc": "https://studio.genlayer.com/api" },
   "constructor": { "params": [] },
   "method_count": 40,

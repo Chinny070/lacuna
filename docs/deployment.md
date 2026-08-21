@@ -25,21 +25,29 @@ python -c "import hashlib,pathlib;print(hashlib.sha256(pathlib.Path('contracts/l
 
 ## Current deployment
 
-- Address: `0x5abdf6380Faaa1f0Eb51cc666A8660D5a8Dd73a6`
-- Source: v0.2.0 protocol hardening, normalized digest
-  `d6aa8bd41ae57784c391e51c720a2516f5bcd246b37d93771e0a10f1c4640656`
+- Address: `0x964a6e11922F9745d46c906c357dfEDAacC64F91`
+- Source: v0.2.1, normalized digest
+  `1331446574fae97336f8867ba3ee172566e431ea1ac85d0ef8b714b7787bb2f7`
 - Deployed and verified 2026-08-21. On a fresh read, `list_agreements`,
   `list_constitutions`, and `list_settlement_policies` each returned `[]`, and
-  `get_agreement("stage11-nonexistent-record")` reverted through `gen_call` as
-  expected. The schema retrieved from the live contract through
-  genlayer-js@1.1.8 matches the repository contract: 40 methods, 17 writes, 23
-  views, zero constructor parameters.
+  an unknown agreement-scoped read reverted through `gen_call` as expected. The
+  schema retrieved from the live contract through genlayer-js@1.1.8 matches the
+  repository contract: 40 methods, 17 writes, 23 views, zero constructor
+  parameters.
 
-Superseded: `0x0FA601A457a03967a5Ed008e2f82e7966392516A` (Stage 9 source,
-normalized digest `d802562731d2744978008585f0a17ef8054b156c55a096c968b297b27a5b0ae2`).
-It is not maintained and lacks every v0.2.0 guarantee. GenLayer contracts are
-not upgraded in place, so each protocol change means a new address and a full
-pass of the rewiring checklist below.
+Superseded, and not maintained:
+
+- `0x5abdf6380Faaa1f0Eb51cc666A8660D5a8Dd73a6` -- v0.2.0, digest
+  `d6aa8bd41ae57784c391e51c720a2516f5bcd246b37d93771e0a10f1c4640656`. Carried
+  every protocol guarantee, but its equivalence principles demanded exact
+  numeric agreement and could not reach consensus on live validators; see
+  `docs/smoke-test.md`.
+- `0x0FA601A457a03967a5Ed008e2f82e7966392516A` -- Stage 9, digest
+  `d802562731d2744978008585f0a17ef8054b156c55a096c968b297b27a5b0ae2`, before
+  the hardening.
+
+GenLayer contracts are not upgraded in place, so each protocol change means a
+new address and a full pass of the rewiring checklist below.
 
 The public method surface is unchanged -- 40 methods, 17 writes, 23 views, zero
 constructor parameters -- so the recorded `methods` arrays stay valid and no

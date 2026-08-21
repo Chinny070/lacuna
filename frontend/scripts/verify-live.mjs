@@ -1,7 +1,7 @@
 import { createClient } from "genlayer-js";
 import { studionet } from "genlayer-js/chains";
 
-const address = process.env.VITE_LACUNA_CONTRACT_ADDRESS ?? "0x5abdf6380Faaa1f0Eb51cc666A8660D5a8Dd73a6";
+const address = process.env.VITE_LACUNA_CONTRACT_ADDRESS ?? "0x964a6e11922F9745d46c906c357dfEDAacC64F91";
 const client = createClient({ chain: studionet });
 const read = (functionName, args = []) => client.readContract({ address, functionName, args });
 
