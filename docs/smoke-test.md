@@ -27,104 +27,117 @@ aligning the next time the contract is redeployed for another reason.
 
 ## Part 2 -- writes (wallet required)
 
-Needs three funded StudioNet wallets: CLIENT, CONTRACTOR, and OUTSIDER (the
-last is used once, to prove a negative). Every write must reach finalized
-successful execution before the next step; a transaction hash is not success.
+Needs three funded StudioNet wallets: CLIENT, CONTRACTOR, and OUTSIDER (used
+once, to prove a negative). Every write must reach finalized successful
+execution before the next step; a transaction hash is not success, and neither
+is a FINALIZED badge next to a Consensus Result of Undetermined.
 
 ### Evidence sources
 
 Freeze fetches every submitted URL once under strict-equality consensus, so
-evidence pages must be byte-identical for every validator. Publish two small
-static files before starting and pin each URL to an immutable revision:
+evidence pages must be byte-identical for every validator. The fixtures in
+`docs/smoke-evidence/` (served from GitHub at a pinned commit) and
+`frontend/public/smoke-evidence/` (served from the deployed site) are built for
+this: two distinct hosts, immutable content.
 
-- a `raw.githubusercontent.com` URL pinned to a commit SHA (not a branch name)
-- a `gist.githubusercontent.com` URL pinned to a revision SHA
+They are also written to be numerically unambiguous. The first smoke run used a
+short three-month snapshot, and validators split on whether it supported a
+baseline at all -- one leader returned VOID, another returned a valid range
+from the same frozen bytes. The current fixtures give nine flat months with a
+30 bps spread and a peer benchmark, so the counterfactual is roughly 3400 bps
+by inspection rather than by extrapolation.
 
-Two different hosts are required -- the constitution below demands two
-independent sources. Give each file a few plausible lines of monthly churn and
-community-activity figures for the stated periods; the adjudicator judges the
-content, so a file with no usable numbers will legitimately produce a VOID
-baseline and stop the run at step 6.
+### Windows
 
-Branch names, dashboards, search pages, and anything with a timestamp or
-rotating content will make the freeze revert. That is the intended behavior,
-not a bug.
+Baseline 2025-07-01 to 2026-04-01 (`1751328000` to `1775001600`), observation
+2026-04-01 to 2026-07-01 (`1775001600` to `1782864000`). The baseline window is
+wide enough to hold the whole historical series as evidence periods; the first
+run's three-month window was not.
 
 ### Sequence
 
-1. `create_baseline_constitution` (any wallet)
-   `"Community Health v1"`, `"monthly_churn_bps"`,
-   `["disputes","escalations"]`, `["contributor_retention","member_activity"]`,
+1. `create_baseline_constitution` -- `"Community Health v1"`,
+   `"monthly_churn_bps"`, `["disputes","escalations"]`,
+   `["contributor_retention","member_activity"]`,
    `"historical_trend_with_benchmark"`,
    `["PUBLIC_ANALYTICS","COMMUNITY_ACTIVITY"]`, `2`,
    `"Exclude windows overlapping a declared market-wide shock."`,
    `["Prefer explicit later evidence over earlier drafts."]`,
    `["PRE_TREND_CHECK","GUARDRAIL_CHECK"]`
 
-2. `create_settlement_policy` (any wallet)
-   `"Standard Settlement v1"`, `2000`, `6000`, `8000`, `1500`, `3000`, `4000`
+2. `create_settlement_policy` -- `"Standard Settlement v1"`, `2000`, `6000`,
+   `8000`, `1500`, `3000`, `4000`
 
-3. `create_agreement` (any wallet) -- use the IDs returned above
-   `"SMOKE-1"`, CLIENT, CONTRACTOR, `"Maintain community stability"`,
-   `"Keep churn and disputes low for six months."`, constitution_id, policy_id,
-   `1767225600`, `1775001600`, `1775001600`, `1782864000`, `10000`
+3. `create_agreement` -- CLIENT and CONTRACTOR must be two addresses you can
+   both sign from, with the windows above and escrow `10000`.
 
-4. `submit_baseline_evidence` (CLIENT), twice:
-   - `"SMOKE-EV-1"`, `"SMOKE-1"`, `"PUBLIC_ANALYTICS"`, raw.githubusercontent
-     URL, any 64-char lowercase hex string, a one-line summary,
-     `"monthly_churn_bps"`, `1767225600`, `1769904000`
-   - `"SMOKE-EV-2"`, `"SMOKE-1"`, `"COMMUNITY_ACTIVITY"`, gist URL, a
-     different 64-char hex string, a one-line summary, `"member_activity"`,
-     `1769904000`, `1772323200`
+4. `submit_baseline_evidence` (CLIENT) for each baseline fixture: the two churn
+   series and the peer benchmark from GitHub, and the activity baseline from
+   the site. Metric refs `monthly_churn_bps` and `member_activity`; periods
+   inside the baseline window.
 
-   `content_hash` is now only a duplicate-submission identifier. Freeze
-   replaces it with the digest of what the protocol actually fetched.
+5. `freeze_baseline_evidence` -- from OUTSIDER first, which must revert with
+   "Only the agreement's client or contractor". Then from CLIENT. Confirm each
+   record then carries `frozen_content`, `frozen_content_hash`, and
+   `submitted_content_hash`, with `content_hash` equal to the frozen digest.
 
-5. `freeze_baseline_evidence("SMOKE-1")` from OUTSIDER first -- **must revert**
-   with "Only the agreement's client or contractor". Then from CLIENT, which
-   must succeed. Read `get_baseline_evidence("SMOKE-EV-1")` afterwards and
-   confirm `frozen_content`, `frozen_content_hash`, and
-   `submitted_content_hash` are all populated, and that `content_hash` now
-   equals `frozen_content_hash`.
+6. `evaluate_baseline` -- first real consensus run.
 
-6. `evaluate_baseline("SMOKE-1")` (CLIENT or CONTRACTOR). This is the first
-   real consensus run. See "What to watch" below.
+7. `accept_baseline` from CLIENT, then from CONTRACTOR. The first call must
+   leave the status at `BASELINE_PROPOSED`.
 
-7. `accept_baseline("SMOKE-1")` from CLIENT, then from CONTRACTOR. The first
-   call must leave the status at `BASELINE_PROPOSED`; the second moves it to
-   `BASELINE_FINAL`.
+8. `start_observation`.
 
-8. `start_observation("SMOKE-1")`.
+9. `submit_outcome_evidence` (CLIENT) for all three outcome fixtures: churn
+   (`monthly_churn_bps`, observed `2200`), contributor retention
+   (`contributor_retention`, observed `9100`), and member activity
+   (`member_activity`, observed `4830`). Freeze refuses unless the primary
+   metric and every guardrail metric are covered. Optionally submit an
+   alternative explanation to exercise that record.
 
-9. `submit_outcome_evidence` (CLIENT) for the primary metric, period
-   `1775001600`-`1777593600`, plus at least one guardrail-metric item over
-   `1777593600`-`1780272000`, using stable URLs on the same two hosts.
-   Optionally `submit_alternative_explanation` to exercise that record.
+10. `freeze_resolution` -- OUTSIDER first, then CLIENT.
 
-10. `freeze_resolution("SMOKE-1")` -- again try OUTSIDER first and confirm it
-    reverts.
+11. `evaluate_performance` -- second real consensus run.
 
-11. `evaluate_performance("SMOKE-1")` -- the second real consensus run.
+12. `get_settlement_preview` -- pure arithmetic, must agree with the verdict.
 
-12. `get_settlement_preview("SMOKE-1")` -- pure arithmetic, should return
-    immediately and agree with the verdict's `performance_bps`.
-
-13. `finalize_verdict("SMOKE-1")` from CLIENT. Must return
+13. `finalize_verdict` from CLIENT: must return
     `AWAITING_COUNTERPARTY_FINALIZATION` with a populated
-    `appeal_window_ends_at`, leaving status at `VERDICT_PROPOSED`. Then call it
-    from CONTRACTOR: status becomes `FINALIZED` and the verdict becomes
-    `FINAL`.
+    `appeal_window_ends_at`. Then from CONTRACTOR: `FINALIZED`.
+
+## What the first run found
+
+Run 1 (contract `0x5abdf6380Faaa1f0Eb51cc666A8660D5a8Dd73a6`, 2026-08-21)
+cleared the freeze path completely: both URLs were fetched under
+strict-equality consensus, and the contract stored 912 and 826 bytes of frozen
+content with matching digests, demoting the submitter hashes to
+`submitted_content_hash`. That is the evidence-binding guarantee working on
+real validators.
+
+`evaluate_baseline` then failed twice with Consensus Result `Undetermined`
+after three leader rotations each, writing no state. The cause was the
+equivalence principle demanding exact numeric agreement on every field.
+Independent validators do not reproduce judgement numbers digit for digit, and
+`confidence_bps` in particular is free-floating: nothing downstream consumes
+it. The steward asked that tolerated disagreement not change the settlement
+band or caps, which is achievable; exact agreement on every digit is not.
+
+The principles are now consequence-aware. Verdict equivalence is judged on
+settlement outcome using the agreement's real policy numbers -- same payment
+band, same answer on the confounder and guardrail caps, with a tight bound
+inside the continuous partial-payment band -- while confidence and quality
+scores carry loose bounds because they gate nothing. Baseline evaluation
+carries a bounded tolerance because a proposed baseline settles nothing until
+both parties accept it.
 
 ## What to watch
 
-The single most informative result is whether steps 6 and 11 reach consensus
-at all. v0.2.0 requires every decision-bearing number to match exactly across
-validators, replacing a +/-1500 bps tolerance. That is the correct guarantee --
-base payment scales linearly between the policy thresholds, so any tolerated
-spread would move the payout -- but it is strictly harder for independent LLM
-validators to satisfy. If these steps revert on equivalence rather than on
-validation, that is a real finding about the tolerance level, not a deployment
-problem, and it is better learned here than in a live settlement.
+Steps 6 and 11 are still the informative ones. If they now finalize with a real
+consensus result, the consequence-aware principle works against live
+validators. If they go Undetermined again, check whether the leaders disagreed
+on a decision field rather than a number -- `method_valid` or a settlement band
+-- because no tolerance can paper over that, and it means the evidence itself
+is genuinely ambiguous.
 
 Two things this run cannot cover:
 

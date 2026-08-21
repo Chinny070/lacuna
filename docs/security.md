@@ -25,9 +25,15 @@ marked untrusted; prompts say to ignore embedded instructions.
 All GenLayer adjudication output is comparative-consensus output followed by
 strict exact-schema parsing. Unknown top-level fields are rejected for baseline,
 challenge, performance, and appeal results. Equivalence permits wording and
-reason-code variation but requires every decision-bearing numeric field to match
-exactly, so tolerated validator disagreement cannot move a settlement band or
-change a confounder/guardrail cap. Performance copies baseline values from the
+reason-code variation, and is judged on settlement consequence rather than on
+digits: verdict results are equivalent only when performance_bps falls in the
+same payment band under the agreement's policy (and within 300 bps inside the
+continuous partial band), and both agree on whether the unresolved-confounder
+and guardrail caps apply. Values on opposite sides of a threshold are never
+equivalent. Confidence and evidence-quality scores carry loose bounds because
+they enter no settlement arithmetic and gate no threshold. Baseline evaluation
+carries a bounded tolerance because a proposed baseline locks only once both
+parties accept it. Performance copies baseline values from the
 locked baseline exactly; refs, BPS values, reason codes, summaries, and
 guardrail consistency are validated deterministically.
 

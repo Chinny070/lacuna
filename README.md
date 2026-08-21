@@ -66,10 +66,13 @@ advisory only: LACUNA has no bonus pool or production token-transfer logic.
   renders differently for each validator (per-request timestamps, nonces,
   personalization) cannot be frozen: the freeze reverts and the package stays
   open. Each frozen item also stores up to 4,000 characters on-chain.
-- Adjudication consensus requires exact agreement on every decision-bearing
-  number. Because base payment scales linearly between the minimum and full
-  thresholds, any tolerated numeric spread would change the settlement result,
-  so disagreement fails consensus instead of silently moving the payout.
+- Adjudication consensus is judged by settlement consequence, not by digits.
+  Two validator results are equivalent only if they land in the same payment
+  band under the agreement's own policy and agree on whether the confounder and
+  guardrail caps apply; inside the continuous partial-payment band they must
+  also be within 300 bps. Confidence and evidence-quality scores carry loose
+  bounds because nothing downstream consumes them. Exact numeric agreement was
+  tried first and could not reach consensus on-chain -- see `docs/smoke-test.md`.
 - A verdict finalizes on both parties' acknowledgement, or on one party's
   after the seven-day appeal window closes with no appeal open. The window is a
   protocol constant measured against the VM clock, not a party-supplied

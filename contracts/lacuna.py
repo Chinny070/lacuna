@@ -203,6 +203,28 @@ MAX_BASELINE_SUMMARY_LEN = 1000
 # on-chain evidence footprint remain bounded.
 MAX_EVIDENCE_PAGE_CHARS = 4000
 
+# --- Consensus equivalence tolerances ---
+#
+# Independent validators do not reproduce judgement numbers digit for digit,
+# so an equivalence principle demanding exact numeric agreement cannot reach
+# consensus at all -- verified on-chain, twice, before these bounds existed.
+# What must never be tolerated is disagreement that changes what gets paid.
+#
+# Baseline evaluation carries no settlement effect on its own: a proposed
+# baseline only locks once BOTH parties accept it, so a spread here is
+# ratified by the counterparties rather than silently converted into money.
+BASELINE_EQUIVALENCE_TOLERANCE_BPS = 1000
+# Confidence and evidence-quality scores never enter settlement arithmetic
+# and gate no threshold, so they carry the loosest bound.
+CONFIDENCE_EQUIVALENCE_TOLERANCE_BPS = 2000
+# Performance judgement fields that shape reasoning but do not by themselves
+# select a settlement band or trigger a cap.
+JUDGEMENT_EQUIVALENCE_TOLERANCE_BPS = 1000
+# Inside the partial-payment band the payout is linear in performance_bps, so
+# same-band agreement alone would still leave the amount floating. This caps
+# how far two in-band results may diverge.
+PARTIAL_BAND_EQUIVALENCE_TOLERANCE_BPS = 300
+
 _BASELINE_REQUIRED_FIELDS = (
     "expected_value_bps",
     "expected_low_bps",
@@ -779,6 +801,40 @@ def _commit_frozen_evidence_snapshots(evidence_records: list[dict]) -> None:
         record["content_hash"] = snapshot["content_hash"]
         record["frozen_content_hash"] = snapshot["content_hash"]
         record["frozen_content"] = snapshot["content"]
+
+
+def _settlement_equivalence_clause(policy: dict) -> str:
+    """The consequence-aware core of the verdict equivalence principle.
+
+    Two validator results are equivalent only when they settle the same way:
+    the same payment band under this agreement's policy, and the same answer
+    on whether each cap applies. Numbers may differ inside a band; they may
+    never straddle a threshold, which is the failure the steward review
+    called out.
+    """
+    minimum = int(policy["minimum_performance_bps"])
+    full = int(policy["full_payment_threshold_bps"])
+    confounder = int(policy["max_unresolved_confounder_bps"])
+    return (
+        "Equivalence is judged by settlement consequence under this agreement's "
+        f"settlement policy: minimum_performance_bps={minimum}, "
+        f"full_payment_threshold_bps={full}, "
+        f"max_unresolved_confounder_bps={confounder}. Two results are equivalent "
+        "only if all of the following hold. (a) performance_bps must fall in the "
+        f"same payment band: both below {minimum}, or both at or above {full}, or "
+        f"both strictly between {minimum} and {full} and within "
+        f"{PARTIAL_BAND_EQUIVALENCE_TOLERANCE_BPS} of each other. Values on "
+        "opposite sides of either threshold are NOT equivalent, however close "
+        "they look. (b) Both must agree on whether "
+        f"alternative_explanation_strength_bps exceeds {confounder}, because that "
+        "decides whether the unresolved-confounder cap applies. (c) Both must "
+        "agree on whether guardrail_penalty_bps is greater than zero, because "
+        "that decides whether the guardrail cap applies. (d) Remaining numeric "
+        "fields -- observed_value_bps, meaningful_deviation_bps, attribution_bps, "
+        f"deviation_confidence_bps, evidence_confidence_bps -- must be within "
+        f"{JUDGEMENT_EQUIVALENCE_TOLERANCE_BPS} of each other; they inform the "
+        "reasoning but do not select a band or trigger a cap."
+    )
 
 
 def _appeal_window_deadline(now: datetime) -> str:
@@ -1562,15 +1618,19 @@ Return this exact JSON shape:
             result = result.replace("```json", "").replace("```", "").strip()
             return result
 
-        # Numeric baseline disagreement can propagate into a different
-        # performance and settlement outcome. Consensus therefore permits
-        # wording variation only; every decision-bearing numeric value must
-        # agree exactly.
+        # A proposed baseline settles nothing by itself: it locks only when
+        # both parties accept it, so a bounded numeric spread here is ratified
+        # by the counterparties rather than silently turned into money. The
+        # decision that the evidence supports a baseline at all still has to
+        # match exactly.
         principle = (
             "Agreement is about the baseline conclusion, not wording. method_valid "
             "must match exactly -- both must agree on whether the evidence supports "
-            "a defensible baseline at all. expected_value_bps, expected_low_bps, "
-            "expected_high_bps, and confidence_bps must each match exactly. "
+            "a defensible baseline at all. expected_value_bps, expected_low_bps, and "
+            f"expected_high_bps must each be within {BASELINE_EQUIVALENCE_TOLERANCE_BPS} "
+            f"of each other, and confidence_bps within "
+            f"{CONFIDENCE_EQUIVALENCE_TOLERANCE_BPS}; this baseline cannot settle "
+            "anything until both the client and the contractor accept it. "
             "evidence_refs must reference substantially the same evidence "
             "items. reason_codes must convey the same overall assessment: an exact "
             "set match is NOT required, and differing counts or ordering are "
@@ -1902,8 +1962,11 @@ Return this exact JSON shape:
         principle = (
             "Agreement is about the challenge decision, not wording. decision must "
             "match exactly. replacement_required must match exactly. When decision "
-            "is MODIFY, expected_value_bps, expected_low_bps, expected_high_bps, and "
-            "confidence_bps must each match exactly. evidence_refs "
+            "is MODIFY, expected_value_bps, expected_low_bps, and expected_high_bps "
+            f"must each be within {BASELINE_EQUIVALENCE_TOLERANCE_BPS} of each other "
+            f"and confidence_bps within {CONFIDENCE_EQUIVALENCE_TOLERANCE_BPS}; a "
+            "modified baseline still requires both parties' acceptance before it "
+            "locks. evidence_refs "
             "must reference substantially the same evidence items. reason_codes must "
             "convey the same overall assessment: an exact set match is NOT required. "
             "The summary must convey the same meaning."
@@ -2680,21 +2743,17 @@ Return this exact JSON shape:
             result = result.replace("```json", "").replace("```", "").strip()
             return result
 
+        settlement_policy = json.loads(self.settlement_policies[agreement["settlement_policy_id"]])
         principle = (
             "Agreement is about the performance conclusion, not wording. "
             "baseline_expected_bps, baseline_low_bps, and baseline_high_bps must "
             "match exactly (they are a locked copy, not a judgement). "
-            "observed_value_bps, meaningful_deviation_bps, deviation_confidence_bps, "
-            "attribution_bps, evidence_confidence_bps, "
-            "alternative_explanation_strength_bps, guardrail_penalty_bps, and "
-            "performance_bps must each match exactly. This is settlement-consequence "
-            "aware: no numeric disagreement may cross a policy threshold or change "
-            "a confounder/guardrail cap. reason_codes "
-            "must convey the same overall assessment: an exact set match is NOT "
-            "required, and differing counts or ordering are acceptable so long as "
-            "neither set contradicts the other. evidence_refs must reference "
-            "substantially the same evidence items. The summary must convey the "
-            "same meaning."
+            + _settlement_equivalence_clause(settlement_policy)
+            + " reason_codes must convey the same overall assessment: an exact set "
+            "match is NOT required, and differing counts or ordering are acceptable "
+            "so long as neither set contradicts the other. evidence_refs must "
+            "reference substantially the same evidence items. The summary must "
+            "convey the same meaning."
         )
 
         raw_result = gl.eq_principle.prompt_comparative(leader, principle)
@@ -3009,12 +3068,14 @@ Return JSON only with decision, replacement_required, and all these fields:
             result = gl.nondet.exec_prompt(task)
             return result.replace("```json", "").replace("```", "").strip()
 
+        settlement_policy = json.loads(self.settlement_policies[agreement["settlement_policy_id"]])
         principle = (
             "Agreement is about appeal decision and substantive verdict meaning, not wording. "
             "decision and replacement_required must match exactly. Locked baseline fields must "
-            "match exactly. Numeric verdict fields must each match exactly so no validator "
-            "disagreement can change a settlement threshold or cap; reason_codes and "
-            "evidence_refs must convey substantially the same supported conclusion."
+            "match exactly. "
+            + _settlement_equivalence_clause(settlement_policy)
+            + " reason_codes and evidence_refs must convey substantially the same "
+            "supported conclusion."
         )
         raw = gl.eq_principle.prompt_comparative(leader, principle)
         result = _validate_appeal_verdict(raw, valid_refs, locked_baseline, primary_bounds)
