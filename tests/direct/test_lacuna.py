@@ -1,5 +1,6 @@
 import hashlib
 import json
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -3028,6 +3029,70 @@ def test_resolved_appeal_clears_earlier_finalization_acknowledgement(
     direct_vm.sender = direct_alice
     assert json.loads(lacuna.finalize_verdict(agreement_id))["status"] == "FINAL"
     assert json.loads(lacuna.get_agreement(agreement_id))["status"] == "FINALIZED"
+
+
+def _warp_relative_to_appeal_window(lacuna, direct_vm, agreement_id, seconds):
+    """Move the VM clock to the current appeal-window deadline +/- seconds."""
+    deadline = json.loads(lacuna.get_agreement(agreement_id))["appeal_window_ends_at"]
+    assert deadline
+    direct_vm.warp((datetime.fromisoformat(deadline) + timedelta(seconds=seconds)).isoformat())
+    return deadline
+
+
+def test_appeal_window_closes_before_single_party_can_finalize(
+    direct_deploy, direct_vm, direct_alice, direct_bob
+):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _, _ = _proposed_verdict(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_bob
+
+    # One second before the window closes, the counterparty's acknowledgement
+    # is still required.
+    _warp_relative_to_appeal_window(lacuna, direct_vm, agreement_id, -1)
+    pending = json.loads(lacuna.finalize_verdict(agreement_id))
+    assert pending["status"] == "AWAITING_COUNTERPARTY_FINALIZATION"
+    assert pending["appeal_window_ends_at"]
+    assert json.loads(lacuna.get_agreement(agreement_id))["status"] == "VERDICT_PROPOSED"
+
+    # Once it closes with no appeal opened, settlement is no longer hostage to
+    # a counterparty that never responds.
+    _warp_relative_to_appeal_window(lacuna, direct_vm, agreement_id, 1)
+    final = json.loads(lacuna.finalize_verdict(agreement_id))
+    assert final["status"] == "FINAL"
+    assert json.loads(lacuna.get_agreement(agreement_id))["status"] == "FINALIZED"
+
+
+def test_resolved_appeal_restarts_the_appeal_window(
+    direct_deploy, direct_vm, direct_alice, direct_bob
+):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _, _ = _proposed_verdict(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_bob
+    first_deadline = _warp_relative_to_appeal_window(lacuna, direct_vm, agreement_id, -1)
+
+    lacuna.open_appeal("APP-1", agreement_id, "ATTRIBUTION_OVERSTATED", "Review attribution.", ["OUT-1"])
+    direct_vm.clear_mocks()
+    direct_vm.mock_llm(r".*", _fenced(_appeal_result("UPHOLD")))
+    lacuna.evaluate_appeal("APP-1")
+
+    agreement = json.loads(lacuna.get_agreement(agreement_id))
+    assert datetime.fromisoformat(agreement["appeal_window_ends_at"]) > datetime.fromisoformat(first_deadline)
+    # The expired first window cannot be reused to close the upheld verdict.
+    assert json.loads(lacuna.finalize_verdict(agreement_id))["status"] == "AWAITING_COUNTERPARTY_FINALIZATION"
+
+
+def test_voided_verdict_clears_the_appeal_window(direct_deploy, direct_vm, direct_alice, direct_bob):
+    lacuna = direct_deploy("contracts/lacuna.py")
+    agreement_id, _, _ = _proposed_verdict(lacuna, direct_vm, direct_alice, direct_bob)
+    direct_vm.sender = direct_alice
+    lacuna.open_appeal("APP-1", agreement_id, "ATTRIBUTION_OVERSTATED", "Review attribution.", ["OUT-1"])
+    direct_vm.clear_mocks()
+    direct_vm.mock_llm(r".*", _fenced(_appeal_result("VOID")))
+    lacuna.evaluate_appeal("APP-1")
+
+    agreement = json.loads(lacuna.get_agreement(agreement_id))
+    assert agreement["status"] == "RESOLUTION_FROZEN"
+    assert agreement["appeal_window_ends_at"] == ""
 
 
 def test_finalize_blocked_by_unresolved_appeal_and_void_verdict(direct_deploy, direct_vm, direct_alice, direct_bob):

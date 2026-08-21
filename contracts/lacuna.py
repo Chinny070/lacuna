@@ -5,7 +5,7 @@ from genlayer import *
 import json
 import hashlib
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
 # --- Status constants (spec section 15 / brief section 7) ---
@@ -113,6 +113,16 @@ ESCROW_AMOUNT_MAX = (1 << 128) - 1
 # Windows are unix-epoch seconds, deterministic integers supplied by the
 # caller (no wall-clock reads inside the contract).
 WINDOW_TIMESTAMP_MAX = (1 << 63) - 1
+
+# Authoritative appeal window. A proposed verdict cannot be finalized by one
+# party alone until this much VM time has passed since it was proposed, which
+# gives the counterparty a protocol-defined opportunity to appeal rather than
+# one granted at the favored party's discretion. Both parties acknowledging
+# still finalizes immediately; the window is the fallback that keeps a
+# stonewalling counterparty from freezing settlement forever. Measured against
+# datetime.now(), which the VM supplies per transaction -- the same clock the
+# contract already trusts to derive verdict IDs consistently.
+APPEAL_WINDOW_SECONDS = 7 * 24 * 60 * 60
 
 # Baseline evidence bounds (brief section 12).
 EVIDENCE_ID_MAX_LEN = 100
@@ -771,6 +781,28 @@ def _commit_frozen_evidence_snapshots(evidence_records: list[dict]) -> None:
         record["frozen_content"] = snapshot["content"]
 
 
+def _appeal_window_deadline(now: datetime) -> str:
+    """Deadline for the authoritative appeal window, as an ISO string."""
+    return (now + timedelta(seconds=APPEAL_WINDOW_SECONDS)).isoformat()
+
+
+def _appeal_window_elapsed(agreement: dict) -> bool:
+    """True once the current verdict's appeal window has closed.
+
+    Both sides of the comparison come from the VM clock via datetime.now(),
+    so they are always the same kind of value. A missing or unparseable
+    deadline is treated as still open: the safe direction is to keep
+    requiring both parties' acknowledgement.
+    """
+    deadline = agreement.get("appeal_window_ends_at", "")
+    if not isinstance(deadline, str) or not deadline:
+        return False
+    try:
+        return datetime.now() >= datetime.fromisoformat(deadline)
+    except ValueError:
+        return False
+
+
 def _get_verified_frozen_content(evidence: dict) -> str:
     content = evidence.get("frozen_content")
     content_hash = evidence.get("frozen_content_hash")
@@ -927,6 +959,7 @@ class Lacuna(gl.Contract):
             "contractor_baseline_acceptance": False,
             "client_verdict_finalization": False,
             "contractor_verdict_finalization": False,
+            "appeal_window_ends_at": "",
             "created_by": gl.message.sender_address.as_hex,
             "created_at": datetime.now().isoformat(),
         }
@@ -2673,7 +2706,8 @@ Return this exact JSON shape:
             raw_result, valid_evidence_refs, locked_baseline, primary_metric_bounds
         )
 
-        now_iso = datetime.now().isoformat()
+        now_dt = datetime.now()
+        now_iso = now_dt.isoformat()
         seed = f"{agreement_id}|{now_iso}|{int(self.verdict_count)}"
         verdict_id = "verdict-" + hashlib.sha256(seed.encode()).hexdigest()[:16]
         if verdict_id in self.verdicts:
@@ -2711,6 +2745,7 @@ Return this exact JSON shape:
         agreement["verdict_id"] = verdict_id
         agreement["client_verdict_finalization"] = False
         agreement["contractor_verdict_finalization"] = False
+        agreement["appeal_window_ends_at"] = _appeal_window_deadline(now_dt)
         agreement["status"] = "VERDICT_PROPOSED"
         self.agreements[agreement_id] = json.dumps(agreement)
 
@@ -2984,7 +3019,8 @@ Return JSON only with decision, replacement_required, and all these fields:
         raw = gl.eq_principle.prompt_comparative(leader, principle)
         result = _validate_appeal_verdict(raw, valid_refs, locked_baseline, primary_bounds)
 
-        now_iso = datetime.now().isoformat()
+        now_dt = datetime.now()
+        now_iso = now_dt.isoformat()
         replacement_id = ""
         if result["decision"] == "UPHOLD":
             original["status"] = "PROPOSED"
@@ -2992,6 +3028,7 @@ Return JSON only with decision, replacement_required, and all these fields:
             agreement["verdict_id"] = appeal["verdict_id"]
             agreement["client_verdict_finalization"] = False
             agreement["contractor_verdict_finalization"] = False
+            agreement["appeal_window_ends_at"] = _appeal_window_deadline(now_dt)
             agreement["status"] = "VERDICT_PROPOSED"
         elif result["decision"] == "MODIFY":
             original["status"] = "VOID"
@@ -3016,6 +3053,7 @@ Return JSON only with decision, replacement_required, and all these fields:
             agreement["verdict_id"] = replacement_id
             agreement["client_verdict_finalization"] = False
             agreement["contractor_verdict_finalization"] = False
+            agreement["appeal_window_ends_at"] = _appeal_window_deadline(now_dt)
             agreement["status"] = "VERDICT_PROPOSED"
         else:
             original["status"] = "VOID"
@@ -3023,6 +3061,7 @@ Return JSON only with decision, replacement_required, and all these fields:
             agreement["verdict_id"] = ""
             agreement["client_verdict_finalization"] = False
             agreement["contractor_verdict_finalization"] = False
+            agreement["appeal_window_ends_at"] = ""
             agreement["status"] = "RESOLUTION_FROZEN"
 
         appeal["status"] = "RESOLVED"
@@ -3075,13 +3114,24 @@ Return JSON only with decision, replacement_required, and all these fields:
         if sender.lower() == agreement["contractor"].lower():
             agreement["contractor_verdict_finalization"] = True
 
-        if not agreement["client_verdict_finalization"] or not agreement["contractor_verdict_finalization"]:
+        # Two independent routes to FINAL, and no others. Either both parties
+        # acknowledge the verdict, or the authoritative appeal window has run
+        # out with no appeal opened -- the unresolved-appeal guard above still
+        # applies in both cases. A verdict can therefore never be closed by the
+        # favored party before the counterparty has had its window, and a
+        # counterparty that simply never responds cannot strand settlement.
+        both_acknowledged = (
+            agreement["client_verdict_finalization"]
+            and agreement["contractor_verdict_finalization"]
+        )
+        if not both_acknowledged and not _appeal_window_elapsed(agreement):
             self.agreements[agreement_id] = json.dumps(agreement)
             return json.dumps(
                 {
                     "status": "AWAITING_COUNTERPARTY_FINALIZATION",
                     "client_verdict_finalization": agreement["client_verdict_finalization"],
                     "contractor_verdict_finalization": agreement["contractor_verdict_finalization"],
+                    "appeal_window_ends_at": agreement.get("appeal_window_ends_at", ""),
                 }
             )
 

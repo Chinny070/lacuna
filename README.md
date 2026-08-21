@@ -31,6 +31,12 @@ agreement party may freeze either evidence package. Freeze captures a bounded,
 consensus-agreed evidence snapshot and stores its SHA-256 digest; later
 adjudication uses that immutable snapshot, not silently changed live pages.
 
+A proposed verdict opens a seven-day appeal window. It becomes `FINALIZED` when
+both parties acknowledge it, or when one party finalizes after the window has
+closed with no appeal open -- so the favored party cannot close settlement
+before the counterparty can appeal, and an unresponsive counterparty cannot
+hold it open forever.
+
 ## Attribution and settlement
 
 LACUNA does not ask whether a contractor “did a good job.” It asks whether the
@@ -64,10 +70,10 @@ advisory only: LACUNA has no bonus pool or production token-transfer logic.
   number. Because base payment scales linearly between the minimum and full
   thresholds, any tolerated numeric spread would change the settlement result,
   so disagreement fails consensus instead of silently moving the payout.
-- A verdict finalizes only on both parties' acknowledgement. The contract reads
-  no trusted clock, so it cannot expire an appeal window; a party that never
-  acknowledges leaves the agreement in `VERDICT_PROPOSED`. Nothing is
-  transferred or lost -- settlement is advisory -- but the record stays open.
+- A verdict finalizes on both parties' acknowledgement, or on one party's
+  after the seven-day appeal window closes with no appeal open. The window is a
+  protocol constant measured against the VM clock, not a party-supplied
+  deadline, so neither side can shorten it or stall settlement indefinitely.
 - `source_host` stores the raw normalized hostname. Different subdomains may
   share an owner; LACUNA does not claim this proves independence because safe
   registrable-domain normalization needs public-suffix data.

@@ -11,14 +11,16 @@ Safe write sequence:
 4. Dual-accept the proposed baseline.
 5. Start observation; submit/freeze outcome evidence and explanations.
 6. Evaluate performance; resolve an appeal if opened; inspect preview.
-7. Both parties call `finalize_verdict`; the second call makes the verdict FINAL.
+7. Both parties call `finalize_verdict`, or one party calls it after the
+   seven-day appeal window on the agreement's `appeal_window_ends_at` closes.
 
 Only client and contractor addresses may submit evidence, freeze a package,
 request evaluation, challenge/appeal, accept a baseline, or finalize. Freezing
 fetches each stored evidence URL once under consensus, so a freeze reverts if a
 source is unreachable; the first `finalize_verdict` call returns
-`AWAITING_COUNTERPARTY_FINALIZATION` rather than finalizing, and resolving an
-appeal clears both acknowledgements. Views return JSON strings.
+`AWAITING_COUNTERPARTY_FINALIZATION` (with the appeal deadline) rather than
+finalizing, and resolving an appeal clears both acknowledgements and restarts
+the window. Views return JSON strings.
 Wait for finalized successful execution before reading derived state. The
 Stage 12 React/TypeScript frontend in `frontend/` provides schema-backed
 StudioNet adapters for all 40 methods at

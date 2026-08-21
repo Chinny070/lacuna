@@ -31,10 +31,20 @@ change a confounder/guardrail cap. Performance copies baseline values from the
 locked baseline exactly; refs, BPS values, reason codes, summaries, and
 guardrail consistency are validated deterministically.
 
-A proposed verdict becomes FINAL only after both the client and the contractor
-call `finalize_verdict`. Either party can appeal before that, and resolving an
-appeal clears both acknowledgements, so no favored party can close settlement
-before the counterparty has had its opportunity to appeal.
+Proposing a verdict stamps an authoritative appeal deadline
+(`appeal_window_ends_at`, `APPEAL_WINDOW_SECONDS` = 7 days) on the agreement.
+`finalize_verdict` reaches FINAL by exactly two routes: both the client and the
+contractor have called it, or one party calls it after that deadline has
+passed. Both routes still refuse to finalize while an appeal is unresolved.
+Resolving an appeal clears both acknowledgements and restarts the window for
+the verdict that survives, and a voided verdict clears it entirely. So a
+favored party cannot close settlement before the counterparty's window, and a
+counterparty that never responds cannot strand it.
+
+The deadline is compared against `datetime.now()`, which the VM supplies per
+transaction -- the same clock the contract already relies on to derive
+consistent verdict IDs. It is a protocol constant, never a party-supplied
+value, so neither side can shorten its counterparty's window.
 
 There is no admin override, arbitrary manual baseline/verdict replacement, or
 production token-transfer logic. Historical records remain queryable and final
