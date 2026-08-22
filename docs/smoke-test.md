@@ -132,6 +132,55 @@ scores carry loose bounds because they gate nothing. Baseline evaluation
 carries a bounded tolerance because a proposed baseline settles nothing until
 both parties accept it.
 
+## Run 2 results
+
+Run 2 (contract `0x964a6e11922F9745d46c906c357dfEDAacC64F91`, agreement
+`SMOKE-3`, 2026-08-21/22) exercised the full lifecycle end to end against real
+StudioNet validators and real wallets, and each steward item was verified as
+an on-chain transaction, not a mocked assertion:
+
+- **Party-gating.** An unrelated wallet called `freeze_baseline_evidence` on
+  `SMOKE-3` and reverted with `Only the agreement's client or contractor may
+  freeze baseline evidence`. The client wallet then froze successfully.
+
+- **Freeze-time evidence binding.** All three frozen baseline records show a
+  `frozen_content_hash` distinct from the submitted placeholder, confirming
+  the contract fetched and hashed the actual page content at freeze time
+  rather than trusting the submitter's claimed hash.
+
+- **Consequence-aware consensus, baseline.** `evaluate_baseline` reached
+  `Consensus Result: Accepted` on the first attempt (no rotations), returning
+  `expected_value_bps: 3340` (range 3050-3690, `confidence_bps: 6200`) built
+  from three independent sources across two categories
+  (`COMMUNITY_ACTIVITY`, `MARKET_BENCHMARK`, `PUBLIC_ANALYTICS`). Both parties
+  then called `accept_baseline`; the first call left the agreement at
+  `BASELINE_PROPOSED`, and only the second flipped it to `BASELINE_FINAL`.
+
+- **Consequence-aware consensus, verdict.** `evaluate_performance` also
+  reached `Consensus Result: Accepted` on the first attempt, returning
+  `performance_bps: 1000` (full attribution), `guardrail_penalty_bps: 0`, and
+  reason codes citing persistent, corroborated improvement with no competing
+  explanation -- a coherent judgement call from independent validators, not
+  just a converged number.
+
+- **Dual-acknowledged finalization.** The client called `finalize_verdict`
+  alone; the agreement returned `status: AWAITING_COUNTERPARTY_FINALIZATION`
+  with `client_verdict_finalization: true`, `contractor_verdict_finalization:
+  false`, and a populated `appeal_window_ends_at` -- confirming a single party
+  cannot finalize early. The contractor then called `finalize_verdict` and the
+  verdict flipped to `status: FINAL`.
+
+One evidence mistake surfaced along the way and is worth recording: an
+earlier attempt on agreement `SMOKE-2` used a mistyped fixture URL
+(`member-activity-2026-02.md` instead of the actual
+`member-activity-2026-q2.md`), which the leader correctly flagged as a
+missing-page snapshot and returned `method_valid: false` / `status: VOID`.
+Per the contract's design, this left the agreement's frozen evidence
+untouched and unusable for a redo (frozen evidence is immutable), so the test
+continued on a fresh agreement (`SMOKE-3`) with the corrected URL. This is
+the intended failure mode: bad evidence produces a defensible refusal, not a
+fabricated baseline.
+
 ## What to watch
 
 Steps 6 and 11 are still the informative ones. If they now finalize with a real
